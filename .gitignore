@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.log
+
+# Local-only config / secrets
+config_local.py
+*.env
+.env
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+*.iml
