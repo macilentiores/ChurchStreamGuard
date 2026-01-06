@@ -1,16 +1,32 @@
 """
-church_stream_guard.py
+church_stream_guard_UPDATED_v6b.py
 
-OBS (Open Broadcaster Software) + Proclaim MIDI (Musical Instrument Digital Interface) guard app
-for:
-- timed start / MIDI backup start
-- stop stream + delay + camera power off
-- record on/off
-- camera PTZ preset recall via VISCA-over-UDP (Video System Control Architecture)
+OBS (Open Broadcaster Software) + Proclaim MIDI (Musical Instrument Digital Interface) guard app.
 
-New in this version:
-- MIDI notes 70–79 recall presets 1–10
-- Preset labels (pulpit/panorama/etc) shown in HUD + optional HUD buttons for quick testing
+Primary goals:
+- Timed auto-start (Sunday HH:MM in America/Regina) + MIDI backup start
+- Stop stream with delay + camera power OFF
+- Record toggle
+- Camera PTZ preset recall via VISCA-over-UDP (Video System Control Architecture)
+- Small HUD with clear status + timer countdown + manual override buttons
+
+MIDI mapping (default):
+- 60: Start stream (backup to timer)
+- 61: Stop stream (requests stop; actual stop after STOP_DELAY_SECONDS)
+- 62: Record toggle
+- 70..79: Presets 1..10 (labels configurable)
+
+Notes:
+- Accepts Proclaim velocity=0 (many systems treat note_on velocity 0 as note_off);
+  we treat BOTH note_on and note_off as triggers for reliability.
+- MIDI port matching uses a substring; set it to "proclaim to script" to match
+  "proclaim to script 0" on Windows.
+
+Requires:
+- obsws-python
+- mido
+- python-rtmidi
+- tzdata (recommended on Windows for ZoneInfo)
 """
 
 from __future__ import annotations
@@ -24,12 +40,16 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 try:
-    import mido  # MIDI
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
+try:
+    import mido
 except Exception:
     mido = None
 
 try:
-    # pip install obsws-python
     from obsws_python import ReqClient  # OBS WebSocket v5
 except Exception:
     ReqClient = None
@@ -45,60 +65,52 @@ from tkinter import ttk
 @dataclass
 class Config:
     # ---- Modes ----
-    HOME_TEST_MODE: bool = False
-    # If True, the app will NOT require Proclaim "On Air" to accept MIDI cues
-    # (useful at home; keep False at church if you want a safety gate)
-    REQUIRE_PROCLAIM_ONAIR: bool = False
+    HOME_TEST_MODE: bool = True
 
     # ---- OBS WebSocket ----
     OBS_HOST: str = "127.0.0.1"
     OBS_PORT: int = 4455
-    OBS_PASSWORD: str = ""  # leave blank if auth is OFF in OBS WebSocket
+    OBS_PASSWORD: str = ""  # blank if OBS websocket auth is OFF
 
-    # ---- YouTube/OBS behavior ----
-    STOP_DELAY_SECONDS: int = 30  # after STOP cue, wait then actually stop stream
     AUTO_RECONNECT_OBS: bool = True
+
+    # ---- Stream behavior ----
+    STOP_DELAY_SECONDS: int = 30  # stop requested -> wait N seconds -> stop stream + camera off
+    START_DEBOUNCE_SECONDS: float = 5.0  # ignore repeated start requests within this window
 
     # ---- Camera (FoMaKo) VISCA over UDP ----
     CAMERA_IP: str = "192.168.88.20"
     CAMERA_VISCA_PORT: int = 1259
-
-    # If your camera requires a VISCA-over-IP header wrapper, set True.
-    # FoMaKo + your CameraDirectorII usage strongly suggests "raw VISCA payload" works, so default False.
     VISCA_USE_OVERIP_HEADER: bool = False
-
-    # VISCA address byte:
-    # VISCA uses 8x where x is camera address (1..7) for serial; many IP cams accept x=1 (0x81).
-    VISCA_ADDR: int = 0x81
-
-    # Preset numbering base:
-    # PTZOptics command list defines pp as memory number 0..127. Many cams map "Preset 1" => pp=0.
-    # If your camera maps "Preset 1" => pp=1, set this to 1.
-    PRESET_NUMBER_BASE: int = 0
-
-    # When a preset MIDI note arrives and the camera is "asleep", should we auto-wake first?
+    VISCA_ADDR: int = 0x81  # common for IP cams
+    CAMERA_BOOT_SECONDS: int = 20  # wait after camera power on before "ready"
     CAMERA_AUTO_WAKE_ON_PRESET: bool = True
 
-    CAMERA_BOOT_SECONDS: int = 20  # wait after camera power-on before starting stream
+    # Many IP cams map "Preset 1" -> pp=0 in VISCA.
+    PRESET_NUMBER_BASE: int = 0
 
     # ---- MIDI ----
-    MIDI_INPUT_PORT_SUBSTRING: str = "loopMIDI"  # partial match for port name
-    MIDI_CHANNEL_1_BASED: int = 1  # Proclaim commonly uses channel 1
+    # IMPORTANT: set to match your enumerated port, e.g. "proclaim to script"
+    # so it matches "proclaim to script 0"
+    MIDI_INPUT_PORT_SUBSTRING: str = "proclaim to script"
+    MIDI_CHANNEL_1_BASED: int = 1
 
-    # MIDI notes:
     NOTE_START_STREAM: int = 60
     NOTE_STOP_STREAM: int = 61
     NOTE_REC_TOGGLE: int = 62
 
-    # Presets: notes 70..79 => presets 1..10
     NOTE_PRESET_FIRST: int = 70
     NOTE_PRESET_LAST: int = 79
 
     # ---- Optional timer start (primary start) ----
     USE_TIMER_START: bool = True
-    # Local time (America/Regina) to start stream on Sundays. Example: "09:45"
-    TIMER_START_HHMM: str = "09:45"
+    TIMER_START_HHMM: str = "09:45"  # local Regina time
     TIMER_WEEKDAY: int = 6  # Monday=0 ... Sunday=6
+    TIMEZONE: str = "America/Regina"
+
+    # Timezone fallback if ZoneInfo fails
+    TZ_FALLBACK_MODE: str = "local"  # "local" or "fixed_offset"
+    TZ_FALLBACK_UTC_OFFSET_HOURS: int = -6  # Regina CST year-round
 
     # ---- Labels for presets 1..10 ----
     PRESET_LABELS: Dict[int, str] = field(default_factory=lambda: {
@@ -119,274 +131,684 @@ CFG = Config()
 
 
 # =========================
-# VISCA controller
+# Utilities
 # =========================
 
-class ViscaController:
-    def __init__(self, ip: str, port: int, addr: int, use_header: bool):
-        self.ip = ip
-        self.port = port
-        self.addr = addr
-        self.use_header = use_header
-        self._seq = 1  # for over-IP header (if used)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.settimeout(0.25)
+def _safe_lower(s: str) -> str:
+    return (s or "").lower().strip()
 
-    def _wrap_overip(self, payload: bytes) -> bytes:
-        # Common VISCA-over-IP wrapper: 01 00 00 <len> <seq32> + payload
-        ln = len(payload)
-        hdr = bytes([0x01, 0x00, (ln >> 8) & 0xFF, ln & 0xFF]) + int(self._seq).to_bytes(4, "big")
-        self._seq = (self._seq + 1) & 0xFFFFFFFF
-        return hdr + payload
 
-    def send(self, payload: bytes) -> None:
-        pkt = self._wrap_overip(payload) if self.use_header else payload
-        self._sock.sendto(pkt, (self.ip, self.port))
+def get_tz(cfg: Config):
+    """Return tzinfo or None."""
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(cfg.TIMEZONE)
+    except Exception:
+        return None
 
-    def cam_power_on(self) -> None:
-        # 8x 01 04 00 02 FF  :contentReference[oaicite:2]{index=2}
-        self.send(bytes([self.addr, 0x01, 0x04, 0x00, 0x02, 0xFF]))
 
-    def cam_power_off(self) -> None:
-        # 8x 01 04 00 03 FF  :contentReference[oaicite:3]{index=3}
-        self.send(bytes([self.addr, 0x01, 0x04, 0x00, 0x03, 0xFF]))
+def now_in_cfg_tz(cfg: Config) -> dt.datetime:
+    """Return timezone-aware or naive datetime depending on availability."""
+    tz = get_tz(cfg)
+    if tz is not None:
+        return dt.datetime.now(tz)
 
-    def recall_preset(self, preset_1_based: int, preset_number_base: int) -> Tuple[int, int]:
-        """
-        Returns (pp, preset_1_based) where pp is the VISCA memory number actually sent.
-        Recall: 8x 01 04 3F 02 pp FF  :contentReference[oaicite:4]{index=4}
-        """
-        if not (1 <= preset_1_based <= 10):
-            raise ValueError("preset must be 1..10")
+    # Fallbacks
+    if cfg.TZ_FALLBACK_MODE == "fixed_offset":
+        off = dt.timezone(dt.timedelta(hours=cfg.TZ_FALLBACK_UTC_OFFSET_HOURS))
+        return dt.datetime.now(off)
+    # "local"
+    return dt.datetime.now()
 
-        pp = (preset_1_based - 1 + preset_number_base)  # base=0 means preset1->0
-        if not (0 <= pp <= 127):
-            raise ValueError("computed pp out of range 0..127")
 
-        self.send(bytes([self.addr, 0x01, 0x04, 0x3F, 0x02, pp & 0x7F, 0xFF]))
-        return pp, preset_1_based
+def parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hh, mm = hhmm.strip().split(":")
+    return int(hh), int(mm)
+
+
+def fmt_hms(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 # =========================
-# OBS controller
+# VISCA Camera
+# =========================
+
+class ViscaCamera:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addr = (cfg.CAMERA_IP, cfg.CAMERA_VISCA_PORT)
+
+    def _wrap(self, payload: bytes) -> bytes:
+        # If you ever need VISCA-over-IP wrapper, implement here.
+        # Default False for your FoMaKo.
+        if not self.cfg.VISCA_USE_OVERIP_HEADER:
+            return payload
+        # Minimal "over IP" wrapper placeholder; many cams don't need it.
+        # Keeping as pass-through for safety unless explicitly enabled.
+        return payload
+
+    def send(self, payload: bytes):
+        packet = self._wrap(payload)
+        self.sock.sendto(packet, self.addr)
+
+    def power_on(self):
+        # VISCA: 8x 01 04 00 02 FF
+        self.send(bytes([self.cfg.VISCA_ADDR, 0x01, 0x04, 0x00, 0x02, 0xFF]))
+
+    def power_off(self):
+        # VISCA: 8x 01 04 00 03 FF
+        self.send(bytes([self.cfg.VISCA_ADDR, 0x01, 0x04, 0x00, 0x03, 0xFF]))
+
+    def recall_preset(self, preset_num_1_based: int):
+        # VISCA preset recall: 8x 01 04 3F 02 pp FF (pp=0..127)
+        pp = (preset_num_1_based - 1) + self.cfg.PRESET_NUMBER_BASE
+        if pp < 0:
+            pp = 0
+        if pp > 127:
+            pp = 127
+        self.send(bytes([self.cfg.VISCA_ADDR, 0x01, 0x04, 0x3F, 0x02, pp, 0xFF]))
+
+
+# =========================
+# OBS Control
 # =========================
 
 class ObsController:
-    def __init__(self, host: str, port: int, password: str):
-        self.host = host
-        self.port = port
-        self.password = password
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.client: Optional[ReqClient] = None
+        self.last_error: str = ""
+        self.connected: bool = False
 
     def connect(self) -> bool:
         if ReqClient is None:
+            self.last_error = "obsws-python not installed"
+            self.connected = False
             return False
         try:
-            self.client = ReqClient(host=self.host, port=self.port, password=self.password)
-            # lightweight call to confirm
+            self.client = ReqClient(
+                host=self.cfg.OBS_HOST,
+                port=self.cfg.OBS_PORT,
+                password=self.cfg.OBS_PASSWORD or None,
+                timeout=2,
+            )
+            # light touch test call
             _ = self.client.get_version()
+            self.connected = True
+            self.last_error = ""
             return True
-        except Exception:
+        except Exception as e:
             self.client = None
+            self.connected = False
+            self.last_error = str(e)
             return False
 
-    def is_connected(self) -> bool:
-        return self.client is not None
+    def _ok(self) -> bool:
+        return self.connected and self.client is not None
 
-    def start_stream(self) -> None:
-        if not self.client:
-            raise RuntimeError("OBS not connected")
-        self.client.start_stream()
-
-    def stop_stream(self) -> None:
-        if not self.client:
-            raise RuntimeError("OBS not connected")
-        self.client.stop_stream()
-
-    def start_record(self) -> None:
-        if not self.client:
-            raise RuntimeError("OBS not connected")
-        self.client.start_record()
-
-    def stop_record(self) -> None:
-        if not self.client:
-            raise RuntimeError("OBS not connected")
-        self.client.stop_record()
-
-    def toggle_record(self) -> str:
-        if not self.client:
-            raise RuntimeError("OBS not connected")
-        status = self.client.get_record_status()
-        if status.output_active:
-            self.client.stop_record()
-            return "REC stop"
-        else:
-            self.client.start_record()
-            return "REC start"
-
-    def get_status_text(self) -> str:
-        if not self.client:
-            return "OBS offline"
+    def get_status(self) -> Tuple[bool, bool, str]:
+        """Return (streaming, recording, errtext)."""
+        if not self._ok():
+            return False, False, (self.last_error or "OBS offline")
         try:
-            s = self.client.get_stream_status()
-            r = self.client.get_record_status()
-            parts = []
-            parts.append("STREAM ON" if s.output_active else "stream off")
-            parts.append("REC ON" if r.output_active else "rec off")
-            return " | ".join(parts)
-        except Exception:
-            return "OBS error"
+            out = self.client.get_stream_status()
+            streaming = bool(getattr(out, "output_active", False))
+            # OBS uses separate API for record status
+            rec = self.client.get_record_status()
+            recording = bool(getattr(rec, "output_active", False))
+            return streaming, recording, ""
+        except Exception as e:
+            self.connected = False
+            self.last_error = str(e)
+            return False, False, self.last_error
+
+    def start_stream(self) -> Tuple[bool, str]:
+        if not self._ok():
+            return False, "OBS not connected"
+        try:
+            self.client.start_stream()
+            return True, "OBS: start stream sent"
+        except Exception as e:
+            self.connected = False
+            self.last_error = str(e)
+            return False, self.last_error
+
+    def stop_stream(self) -> Tuple[bool, str]:
+        if not self._ok():
+            return False, "OBS not connected"
+        try:
+            self.client.stop_stream()
+            return True, "OBS: stop stream sent"
+        except Exception as e:
+            self.connected = False
+            self.last_error = str(e)
+            return False, self.last_error
+
+    def toggle_record(self) -> Tuple[bool, str]:
+        if not self._ok():
+            return False, "OBS not connected"
+        try:
+            st = self.client.get_record_status()
+            active = bool(getattr(st, "output_active", False))
+            if active:
+                self.client.stop_record()
+                return True, "OBS: stop record sent"
+            self.client.start_record()
+            return True, "OBS: start record sent"
+        except Exception as e:
+            self.connected = False
+            self.last_error = str(e)
+            return False, self.last_error
 
 
 # =========================
-# MIDI listener
+# MIDI Listener
 # =========================
 
 class MidiListener:
-    def __init__(self, port_substring: str, channel_1_based: int):
-        self.port_substring = port_substring.lower()
-        self.channel_0_based = max(0, channel_1_based - 1)
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
         self.inport = None
-
-    def available_ports(self):
-        if mido is None:
-            return []
-        try:
-            return list(mido.get_input_names())
-        except Exception:
-            return []
+        self.connected_name: str = ""
+        self.last_error: str = ""
 
     def connect(self) -> bool:
         if mido is None:
-            return False
-        ports = self.available_ports()
-        match = None
-        for p in ports:
-            if self.port_substring in p.lower():
-                match = p
-                break
-        if not match:
+            self.last_error = "mido not installed"
             return False
         try:
+            names = mido.get_input_names()
+            wanted = _safe_lower(self.cfg.MIDI_INPUT_PORT_SUBSTRING)
+            match = None
+            for n in names:
+                if wanted in _safe_lower(n):
+                    match = n
+                    break
+            if match is None:
+                self.last_error = f"No MIDI in port matching '{self.cfg.MIDI_INPUT_PORT_SUBSTRING}' (found {len(names)})"
+                return False
             self.inport = mido.open_input(match)
+            self.connected_name = match
+            self.last_error = ""
             return True
-        except Exception:
+        except Exception as e:
             self.inport = None
+            self.connected_name = ""
+            self.last_error = str(e)
             return False
 
-    def poll(self):
-        if not self.inport:
+    def is_connected(self) -> bool:
+        return self.inport is not None
+
+    def pending(self):
+        if self.inport is None:
             return []
-        msgs = []
         try:
-            for msg in self.inport.iter_pending():
-                msgs.append(msg)
+            return list(self.inport.iter_pending())
+        except Exception as e:
+            self.last_error = str(e)
+            self.inport = None
+            self.connected_name = ""
+            return []
+
+    @staticmethod
+    def _msg_note(msg) -> Optional[int]:
+        try:
+            return int(getattr(msg, "note", None))
         except Exception:
-            pass
-        return msgs
+            return None
+
+    @staticmethod
+    def _msg_ch(msg) -> Optional[int]:
+        try:
+            # mido uses 0-based channels
+            return int(getattr(msg, "channel", None))
+        except Exception:
+            return None
+
+    def _channel_ok(self, msg) -> bool:
+        ch0 = self._msg_ch(msg)
+        if ch0 is None:
+            return False
+        return (ch0 + 1) == int(self.cfg.MIDI_CHANNEL_1_BASED)
 
     def is_note_on(self, msg, note: int) -> bool:
-        try:
-            return (msg.type == "note_on"
-                    and msg.channel == self.channel_0_based
-                    and msg.note == note
-                    and msg.velocity > 0)
-        except Exception:
+        """
+        Treat BOTH note_on and note_off as triggers to handle velocity=0 behavior.
+        """
+        if not self._channel_ok(msg):
             return False
+        n = self._msg_note(msg)
+        if n is None or n != int(note):
+            return False
+        t = getattr(msg, "type", "")
+        return t in ("note_on", "note_off")
+
+    def is_note_in_range(self, msg, lo: int, hi: int) -> Optional[int]:
+        if not self._channel_ok(msg):
+            return None
+        n = self._msg_note(msg)
+        if n is None:
+            return None
+        if int(lo) <= n <= int(hi):
+            t = getattr(msg, "type", "")
+            if t in ("note_on", "note_off"):
+                return n
+        return None
 
 
 # =========================
-# App state + HUD
+# App
 # =========================
 
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.obs = ObsController(cfg.OBS_HOST, cfg.OBS_PORT, cfg.OBS_PASSWORD)
-        self.midi = MidiListener(cfg.MIDI_INPUT_PORT_SUBSTRING, cfg.MIDI_CHANNEL_1_BASED)
-        self.visca = ViscaController(cfg.CAMERA_IP, cfg.CAMERA_VISCA_PORT, cfg.VISCA_ADDR, cfg.VISCA_USE_OVERIP_HEADER)
-
-        self.running = True
-
-        self.camera_state = "SLEEP"  # SLEEP | WAKING | AWAKE
-        self.camera_wake_started_at: Optional[float] = None
-
-        self.last_post = ""
-        self.last_midi = ""
-        self.last_cam = ""
-        self.last_obs = ""
-
-        self.stop_pending_until: Optional[float] = None
-
-        # Used to de-bounce looping “start” notes from Proclaim preservice loop
-        self.stream_start_armed = True
-        self.last_start_attempt_at: float = 0.0
-
-        # Timer-based start
-        self.timer_fired_for_date: Optional[dt.date] = None
-
-        # Tkinter HUD
         self.root = tk.Tk()
         self.root.title("Church Stream Guard")
-        self.root.resizable(False, False)
 
+        # state
+        self.running = True
+        self.obs = ObsController(cfg)
+        self.midi = MidiListener(cfg)
+        self.cam = ViscaCamera(cfg)
+
+        self.cam_state = "SLEEP"   # SLEEP | WAKING | AWAKE
+        self.cam_ready_at: float = 0.0
+
+        self._queued_preset: Optional[int] = None
+        self._pending_stream_start: bool = False  # requested start but waiting for cam/obs
+        self._pending_start_reason: str = ""
+
+        self._stop_pending: bool = False
+        self._stop_at: float = 0.0
+
+        self._timer_fired_today_date: Optional[dt.date] = None
+        self._last_start_request_ts: float = 0.0
+
+        # UI variables
+        self.var_mode = tk.StringVar()
+        self.var_timer = tk.StringVar()
+        self.var_obs = tk.StringVar()
+        self.var_midi = tk.StringVar()
+        self.var_cam = tk.StringVar()
+        self.var_last = tk.StringVar()
+
+        # Build UI
         self._build_ui()
+        self._update_mode_text()
+        self._post("Started. Waiting for OBS/MIDI...")
+
+        # background loop thread
+        self.thread = threading.Thread(target=self._runner, daemon=True)
+        self.thread.start()
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        frm = ttk.Frame(self.root, padding=10)
-        frm.grid(row=0, column=0)
+        frm = ttk.Frame(self.root, padding=8)
+        frm.grid(row=0, column=0, sticky="nsew")
 
-        self.var_mode = tk.StringVar(value="HOME TEST" if self.cfg.HOME_TEST_MODE else "CHURCH MODE")
-        self.var_status = tk.StringVar(value="starting…")
-        self.var_obs = tk.StringVar(value="OBS: ?")
-        self.var_midi = tk.StringVar(value="MIDI: ?")
-        self.var_cam = tk.StringVar(value="CAM: ?")
-        self.var_last = tk.StringVar(value="")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        ttk.Label(frm, textvariable=self.var_mode, font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.var_mode, font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.var_timer).grid(row=1, column=0, sticky="w", pady=(2, 6))
 
-        ttk.Label(frm, textvariable=self.var_status).grid(row=1, column=0, sticky="w", pady=(4, 6))
+        ttk.Separator(frm).grid(row=2, column=0, sticky="ew", pady=4)
 
-        ttk.Label(frm, textvariable=self.var_obs).grid(row=2, column=0, sticky="w")
-        ttk.Label(frm, textvariable=self.var_midi).grid(row=3, column=0, sticky="w")
-        ttk.Label(frm, textvariable=self.var_cam).grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.var_obs).grid(row=3, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.var_midi).grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, textvariable=self.var_cam).grid(row=5, column=0, sticky="w")
 
-        ttk.Separator(frm).grid(row=5, column=0, sticky="ew", pady=8)
+        ttk.Label(frm, text="Last:", font=("Segoe UI", 9, "bold")).grid(row=6, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frm, textvariable=self.var_last, wraplength=420).grid(row=7, column=0, sticky="w")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, sticky="ew")
+        btns.grid(row=8, column=0, sticky="w", pady=(10, 0))
 
-        self.btn_start = ttk.Button(btns, text="Start Stream", command=lambda: self._ui_fire("start_stream"))
-        self.btn_stop = ttk.Button(btns, text="Stop Stream", command=lambda: self._ui_fire("stop_stream"))
-        self.btn_rec = ttk.Button(btns, text="REC Toggle", command=lambda: self._ui_fire("rec_toggle"))
+        ttk.Button(btns, text="Start Stream", command=lambda: self._ui_fire("start")).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btns, text="Stop Stream", command=lambda: self._ui_fire("stop")).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(btns, text="REC Toggle", command=lambda: self._ui_fire("rec")).grid(row=0, column=2, padx=(0, 6))
 
-        self.btn_start.grid(row=0, column=0, padx=4)
-        self.btn_stop.grid(row=0, column=1, padx=4)
-        self.btn_rec.grid(row=0, column=2, padx=4)
+        # Preset test buttons (1..8 for compactness)
+        presets = ttk.Frame(frm)
+        presets.grid(row=9, column=0, sticky="w", pady=(10, 0))
 
-        # Preset buttons (for confidence testing without MIDI)
-        presets = ttk.LabelFrame(frm, text="Camera Presets (test)")
-        presets.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        for i in range(1, 9):
+            label = self.cfg.PRESET_LABELS.get(i, f"Preset {i}")
+            ttk.Button(
+                presets,
+                text=f"{i}:{label}",
+                command=lambda p=i: self._ui_preset(p),
+                width=14
+            ).grid(row=(i-1)//4, column=(i-1) % 4, padx=2, pady=2)
 
-        # show the 8 you named as buttons, and keep 9/10 out to reduce clutter
-        row = 0
-        col = 0
-        for p in range(1, 9):
-            label = self.cfg.PRESET_LABELS.get(p, f"Preset {p}")
-            b = ttk.Button(presets, text=f"{p}: {label}", width=18,
-                           command=lambda pp=p: self._fire_preset(pp, source="HUD"))
-            b.grid(row=row, column=col, padx=4, pady=4, sticky="w")
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
+    def _update_mode_text(self):
+        if self.cfg.HOME_TEST_MODE:
+            self.var_mode.set("HOME TEST MODE")
+        else:
+            self.var_mode.set("CHURCH MODE")
 
-        ttk.Separator(frm).grid(row=8, column=0, sticky="ew", pady=8)
-        ttk.Label(frm, text="Last:").grid(row=9, column=0, sticky="w")
-        ttk.Label(frm, textvariable=self.var_last, wraplength=360).grid(row=10, column=0, sticky="w")
+    def _post(self, msg: str):
+        # thread-safe UI update
+        def _do():
+            self.var_last.set(msg)
+        self.root.after(0, _do)
 
-        # Ensure close exits cleanly
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+    def _set_timer_line(self, msg: str):
+        def _do():
+            self.var_timer.set(msg)
+        self.root.after(0, _do)
+
+    def _set_status_lines(self, obs_line: str, midi_line: str, cam_line: str):
+        def _do():
+            self.var_obs.set(obs_line)
+            self.var_midi.set(midi_line)
+            self.var_cam.set(cam_line)
+        self.root.after(0, _do)
+
+    def _ui_fire(self, action: str):
+        # Manual override always allowed
+        if action == "start":
+            self._start_stream_flow("HUD")
+        elif action == "stop":
+            self._request_stop("HUD")
+        elif action == "rec":
+            self._toggle_record("HUD")
+
+    def _ui_preset(self, preset_num: int):
+        self._handle_preset(preset_num, source="HUD")
+
+    # -------- Camera logic --------
+
+    def _camera_wake(self, source: str):
+        if self.cam_state in ("WAKING", "AWAKE"):
+            return
+        self.cam_state = "WAKING"
+        self.cam_ready_at = time.time() + float(self.cfg.CAMERA_BOOT_SECONDS)
+        if self.cfg.HOME_TEST_MODE:
+            self._post(f"{source}: camera wake (simulated) - ready in {self.cfg.CAMERA_BOOT_SECONDS}s")
+        else:
+            try:
+                self.cam.power_on()
+                self._post(f"{source}: camera power ON sent - waiting {self.cfg.CAMERA_BOOT_SECONDS}s")
+            except Exception as e:
+                self._post(f"{source}: camera power ON error: {e}")
+
+    def _camera_sleep(self, source: str):
+        self.cam_state = "SLEEP"
+        self.cam_ready_at = 0.0
+        self._queued_preset = None
+        if self.cfg.HOME_TEST_MODE:
+            self._post(f"{source}: camera sleep (simulated)")
+        else:
+            try:
+                self.cam.power_off()
+                self._post(f"{source}: camera power OFF sent")
+            except Exception as e:
+                self._post(f"{source}: camera power OFF error: {e}")
+
+    def _camera_ready_tick(self):
+        if self.cam_state == "WAKING" and time.time() >= self.cam_ready_at:
+            self.cam_state = "AWAKE"
+            self._post("CAM: awake/ready")
+            # apply queued preset if any
+            if self._queued_preset is not None:
+                p = self._queued_preset
+                self._queued_preset = None
+                self._send_preset(p, source="QUEUE")
+            # if stream start pending, attempt now
+            if self._pending_stream_start:
+                reason = self._pending_start_reason or "PENDING"
+                self._pending_stream_start = False
+                self._pending_start_reason = ""
+                self._start_stream_flow(reason)
+
+    def _send_preset(self, preset_num: int, source: str):
+        label = self.cfg.PRESET_LABELS.get(preset_num, f"Preset {preset_num}")
+        if self.cfg.HOME_TEST_MODE:
+            self._post(f"{source}: preset {preset_num} ({label}) (simulated)")
+            return
+        try:
+            self.cam.recall_preset(preset_num)
+            self._post(f"{source}: preset {preset_num} ({label}) sent")
+        except Exception as e:
+            self._post(f"{source}: preset error: {e}")
+
+    def _handle_preset(self, preset_num: int, source: str):
+        # ensure 1..10
+        if preset_num < 1 or preset_num > 10:
+            self._post(f"{source}: preset {preset_num} ignored (out of range)")
+            return
+
+        if self.cam_state == "SLEEP" and self.cfg.CAMERA_AUTO_WAKE_ON_PRESET:
+            self._queued_preset = preset_num
+            self._camera_wake(source=f"{source}: auto-wake for preset")
+            self._post(f"{source}: queued preset {preset_num} while waking")
+            return
+
+        if self.cam_state == "WAKING":
+            self._queued_preset = preset_num
+            self._post(f"{source}: queued preset {preset_num} (camera waking)")
+            return
+
+        # AWAKE or no auto-wake
+        self._send_preset(preset_num, source=source)
+
+    # -------- OBS logic --------
+
+    def _start_stream_flow(self, source: str):
+        # debounce starts
+        now = time.time()
+        if (now - self._last_start_request_ts) < float(self.cfg.START_DEBOUNCE_SECONDS):
+            self._post(f"{source}: start ignored (debounce)")
+            return
+        self._last_start_request_ts = now
+
+        # Ensure camera is ready (church mode)
+        if not self.cfg.HOME_TEST_MODE:
+            if self.cam_state == "SLEEP":
+                self._pending_stream_start = True
+                self._pending_start_reason = source
+                self._camera_wake(source=f"{source}: wake before start")
+                self._post(f"{source}: start pending (waiting for camera)")
+                return
+            if self.cam_state == "WAKING":
+                self._pending_stream_start = True
+                self._pending_start_reason = source
+                self._post(f"{source}: start pending (camera waking)")
+                return
+
+        # Ensure OBS connected; if not, queue start until OBS reconnects
+        if not self.obs.connected:
+            self._pending_stream_start = True
+            self._pending_start_reason = source
+            self._post(f"{source}: start pending (waiting for OBS connection)")
+            return
+
+        ok, msg = self.obs.start_stream()
+        if ok:
+            self._post(f"{source}: stream start requested")
+        else:
+            # queue again if it was a transient disconnect
+            self._pending_stream_start = True
+            self._pending_start_reason = source
+            self._post(f"{source}: OBS start failed; pending retry ({msg})")
+
+    def _request_stop(self, source: str):
+        self._stop_pending = True
+        self._stop_at = time.time() + int(self.cfg.STOP_DELAY_SECONDS)
+        self._post(f"{source}: stop requested; stopping in {self.cfg.STOP_DELAY_SECONDS}s")
+
+    def _stop_tick(self):
+        if not self._stop_pending:
+            return
+        remaining = int(self._stop_at - time.time())
+        if remaining > 0:
+            self._set_timer_line(f"Stop pending: T-{fmt_hms(remaining)}")
+            return
+
+        # time to stop now
+        self._stop_pending = False
+        self._set_timer_line("")  # clear stop countdown line (timer line will refresh next tick)
+        if self.obs.connected:
+            ok, msg = self.obs.stop_stream()
+            self._post(f"STOP: {msg}" if ok else f"STOP: OBS stop failed ({msg})")
+        else:
+            self._post("STOP: OBS not connected; cannot stop stream")
+
+        # camera off at end (church mode only)
+        if not self.cfg.HOME_TEST_MODE:
+            self._camera_sleep(source="STOP")
+
+    def _toggle_record(self, source: str):
+        if not self.obs.connected:
+            self._post(f"{source}: OBS not connected; cannot toggle record")
+            return
+        ok, msg = self.obs.toggle_record()
+        self._post(f"{source}: {msg}" if ok else f"{source}: REC failed ({msg})")
+
+    # -------- Timer logic --------
+
+    def _timer_target_today(self) -> Optional[dt.datetime]:
+        if not self.cfg.USE_TIMER_START:
+            return None
+        now = now_in_cfg_tz(self.cfg)
+        if now.weekday() != int(self.cfg.TIMER_WEEKDAY):
+            return None
+        hh, mm = parse_hhmm(self.cfg.TIMER_START_HHMM)
+        # keep tz awareness if present
+        if now.tzinfo is not None:
+            return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return dt.datetime(now.year, now.month, now.day, hh, mm, 0)
+
+    def _timer_tick(self):
+        if not self.cfg.USE_TIMER_START:
+            self._set_timer_line("Timer: disabled")
+            return
+
+        now = now_in_cfg_tz(self.cfg)
+
+        # show countdown (even on non-Sunday show next schedule message)
+        if now.weekday() != int(self.cfg.TIMER_WEEKDAY):
+            self._set_timer_line(f"Timer: next Sun {self.cfg.TIMER_START_HHMM} ({self.cfg.TIMEZONE})")
+            return
+
+        target = self._timer_target_today()
+        if target is None:
+            self._set_timer_line(f"Timer: Sun {self.cfg.TIMER_START_HHMM} ({self.cfg.TIMEZONE})")
+            return
+
+        # Fire once per date
+        today = now.date()
+        if self._timer_fired_today_date == today:
+            self._set_timer_line(f"Timer: fired today ({self.cfg.TIMER_START_HHMM})")
+            return
+
+        # countdown
+        delta = int((target - now).total_seconds())
+        if delta > 0:
+            self._set_timer_line(f"Timer: T-{fmt_hms(delta)} to auto-start")
+            return
+
+        # time reached (or passed)
+        self._timer_fired_today_date = today
+        self._set_timer_line("Timer: start time reached")
+        self._start_stream_flow("TIMER")
+
+    # -------- Main loop --------
+
+    async def loop(self):
+        while self.running:
+            # OBS connect/reconnect
+            if not self.obs.connected and self.cfg.AUTO_RECONNECT_OBS:
+                self.obs.connect()
+
+            # MIDI connect/reconnect
+            if not self.midi.is_connected():
+                self.midi.connect()
+
+            # process MIDI messages
+            for msg in self.midi.pending():
+                try:
+                    # Start/Stop/REC
+                    if self.midi.is_note_on(msg, self.cfg.NOTE_START_STREAM):
+                        self._post("MIDI: NOTE 60 (start)")
+                        self._start_stream_flow("MIDI")
+                        continue
+
+                    if self.midi.is_note_on(msg, self.cfg.NOTE_STOP_STREAM):
+                        self._post("MIDI: NOTE 61 (stop)")
+                        self._request_stop("MIDI")
+                        continue
+
+                    if self.midi.is_note_on(msg, self.cfg.NOTE_REC_TOGGLE):
+                        self._post("MIDI: NOTE 62 (rec toggle)")
+                        self._toggle_record("MIDI")
+                        continue
+
+                    pn = self.midi.is_note_in_range(msg, self.cfg.NOTE_PRESET_FIRST, self.cfg.NOTE_PRESET_LAST)
+                    if pn is not None:
+                        preset_num = (pn - self.cfg.NOTE_PRESET_FIRST) + 1
+                        label = self.cfg.PRESET_LABELS.get(preset_num, f"Preset {preset_num}")
+                        self._post(f"MIDI: NOTE {pn} -> preset {preset_num} ({label})")
+                        self._handle_preset(preset_num, source="MIDI")
+                except Exception as e:
+                    self._post(f"MIDI handler error: {e}")
+
+            # if start is pending waiting for OBS, try again once connected
+            if self._pending_stream_start and self.obs.connected:
+                # also need camera ready in church mode
+                if self.cfg.HOME_TEST_MODE or self.cam_state == "AWAKE":
+                    reason = self._pending_start_reason or "PENDING"
+                    self._pending_stream_start = False
+                    self._pending_start_reason = ""
+                    self._start_stream_flow(reason)
+
+            # camera readiness tick
+            self._camera_ready_tick()
+
+            # stop pending tick
+            self._stop_tick()
+
+            # timer tick
+            self._timer_tick()
+
+            # update status lines
+            streaming, recording, err = self.obs.get_status()
+            if err:
+                obs_line = f"OBS: offline ({err})"
+            else:
+                obs_line = f"OBS: {'STREAM ON' if streaming else 'stream off'} / {'REC ON' if recording else 'rec off'}"
+
+            if self.midi.is_connected():
+                midi_line = f"MIDI: connected ({self.midi.connected_name})"
+            else:
+                midi_line = f"MIDI: waiting ({self.midi.last_error})"
+
+            cam_line = f"CAM: {self.cam_state}"
+
+            self._set_status_lines(obs_line, midi_line, cam_line)
+
+            await asyncio.sleep(0.25)
+
+    def _runner(self):
+        try:
+            asyncio.run(self.loop())
+        except Exception as e:
+            # show in HUD
+            self._post(f"Background loop crashed: {e}")
 
     def _on_close(self):
         self.running = False
@@ -395,282 +817,8 @@ class App:
         except Exception:
             pass
 
-    def post(self, msg: str):
-        self.last_post = msg
-        self.var_last.set(msg)
-
-    def _ui_fire(self, action: str):
-        # Manual fallback is ALWAYS allowed
-        if action == "start_stream":
-            self.post("HUD: Start Stream pressed")
-            self._start_stream_flow(source="HUD")
-        elif action == "stop_stream":
-            self.post("HUD: Stop Stream pressed")
-            self._stop_stream_flow(source="HUD")
-        elif action == "rec_toggle":
-            self.post("HUD: REC Toggle pressed")
-            self._rec_toggle_flow(source="HUD")
-
-    def _set_cam_state(self, state: str):
-        self.camera_state = state
-
-    def _wake_camera(self, source: str):
-        if self.cfg.HOME_TEST_MODE:
-            self._set_cam_state("AWAKE")
-            self.last_cam = f"{source}: camera wake (simulated)"
-            self.post(self.last_cam)
-            return
-
-        if self.camera_state in ("WAKING", "AWAKE"):
-            return
-
-        try:
-            self.visca.cam_power_on()
-            self._set_cam_state("WAKING")
-            self.camera_wake_started_at = time.time()
-            self.last_cam = f"{source}: camera power ON (VISCA) → wait {self.cfg.CAMERA_BOOT_SECONDS}s"
-            self.post(self.last_cam)
-        except Exception as e:
-            self.last_cam = f"{source}: camera power ON failed: {e}"
-            self.post(self.last_cam)
-
-    def _sleep_camera(self, source: str):
-        if self.cfg.HOME_TEST_MODE:
-            self._set_cam_state("SLEEP")
-            self.last_cam = f"{source}: camera sleep (simulated)"
-            self.post(self.last_cam)
-            return
-
-        try:
-            self.visca.cam_power_off()
-            self._set_cam_state("SLEEP")
-            self.camera_wake_started_at = None
-            self.last_cam = f"{source}: camera power OFF (VISCA)"
-            self.post(self.last_cam)
-        except Exception as e:
-            self.last_cam = f"{source}: camera power OFF failed: {e}"
-            self.post(self.last_cam)
-
-    def _camera_is_ready(self) -> bool:
-        if self.cfg.HOME_TEST_MODE:
-            return True
-        if self.camera_state == "AWAKE":
-            return True
-        if self.camera_state == "WAKING" and self.camera_wake_started_at is not None:
-            if (time.time() - self.camera_wake_started_at) >= self.cfg.CAMERA_BOOT_SECONDS:
-                self._set_cam_state("AWAKE")
-                return True
-        return False
-
-    def _fire_preset(self, preset_1_based: int, source: str):
-        label = self.cfg.PRESET_LABELS.get(preset_1_based, f"Preset {preset_1_based}")
-
-        if self.camera_state == "SLEEP" and self.cfg.CAMERA_AUTO_WAKE_ON_PRESET:
-            self._wake_camera(source=f"{source}/preset {preset_1_based}")
-            # don’t block; preset will send once ready in loop
-            self.last_cam = f"{source}: queued preset {preset_1_based} ({label}) until camera ready"
-            self.post(self.last_cam)
-            # store a one-shot “pending preset”
-            self._pending_preset = preset_1_based
-            return
-
-        if not self._camera_is_ready():
-            self.last_cam = f"{source}: camera not ready; ignoring preset {preset_1_based} ({label})"
-            self.post(self.last_cam)
-            return
-
-        if self.cfg.HOME_TEST_MODE:
-            self.last_cam = f"{source}: preset {preset_1_based} ({label}) (simulated)"
-            self.post(self.last_cam)
-            return
-
-        try:
-            pp, p = self.visca.recall_preset(preset_1_based, self.cfg.PRESET_NUMBER_BASE)
-            self.last_cam = f"{source}: recall preset {p} ({label}) → VISCA pp={pp}"
-            self.post(self.last_cam)
-        except Exception as e:
-            self.last_cam = f"{source}: preset {preset_1_based} failed: {e}"
-            self.post(self.last_cam)
-
-    def _start_stream_flow(self, source: str):
-        # Debounce: avoid Proclaim loop spam
-        now = time.time()
-        if (now - self.last_start_attempt_at) < 5.0:
-            self.post(f"{source}: start ignored (debounce)")
-            return
-        self.last_start_attempt_at = now
-
-        # Ensure camera wake begins first
-        if self.camera_state == "SLEEP":
-            self._wake_camera(source=f"{source}/start")
-
-        # If camera isn’t ready yet, we’ll start once ready (main loop handles it)
-        if not self._camera_is_ready():
-            self.post(f"{source}: waiting for camera readiness before starting stream…")
-            self._pending_stream_start = True
-            return
-
-        # OBS start
-        if not self.obs.is_connected():
-            self.post(f"{source}: OBS not connected; cannot start stream")
-            return
-
-        try:
-            self.obs.start_stream()
-            self.last_obs = f"{source}: OBS start_stream() sent"
-            self.post(self.last_obs)
-        except Exception as e:
-            self.last_obs = f"{source}: OBS start_stream failed: {e}"
-            self.post(self.last_obs)
-
-    def _stop_stream_flow(self, source: str):
-        # Set a pending stop with delay
-        self.stop_pending_until = time.time() + float(self.cfg.STOP_DELAY_SECONDS)
-        self.post(f"{source}: STOP requested → will stop in {self.cfg.STOP_DELAY_SECONDS}s")
-
-    def _do_stop_now(self, source: str):
-        if not self.obs.is_connected():
-            self.post(f"{source}: OBS not connected; cannot stop stream")
-            return
-        try:
-            self.obs.stop_stream()
-            self.last_obs = f"{source}: OBS stop_stream() sent"
-            self.post(self.last_obs)
-        except Exception as e:
-            self.last_obs = f"{source}: OBS stop_stream failed: {e}"
-            self.post(self.last_obs)
-
-        # Camera should power off after stream stop (your “must not crash all week” requirement)
-        self._sleep_camera(source=f"{source}/after stop")
-
-    def _rec_toggle_flow(self, source: str):
-        if not self.obs.is_connected():
-            self.post(f"{source}: OBS not connected; cannot toggle REC")
-            return
-        try:
-            r = self.obs.toggle_record()
-            self.post(f"{source}: {r}")
-        except Exception as e:
-            self.post(f"{source}: REC toggle failed: {e}")
-
-    def _timer_should_fire(self) -> bool:
-        if not self.cfg.USE_TIMER_START:
-            return False
-
-        now = dt.datetime.now()
-        if now.weekday() != self.cfg.TIMER_WEEKDAY:
-            return False
-
-        try:
-            hh, mm = self.cfg.TIMER_START_HHMM.split(":")
-            target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-        except Exception:
-            return False
-
-        # fire if time has passed and not already fired today
-        if now >= target:
-            if self.timer_fired_for_date == now.date():
-                return False
-            self.timer_fired_for_date = now.date()
-            return True
-        return False
-
-    def _update_ui(self):
-        self.var_obs.set(f"OBS: {self.obs.get_status_text()}")
-        ports = self.midi.available_ports()
-        midi_ok = "connected" if self.midi.inport else "waiting"
-        self.var_midi.set(f"MIDI: {midi_ok} ({len(ports)} ports seen)")
-        self.var_cam.set(f"CAM: {self.camera_state}")
-        self.var_status.set(self.last_post)
-
-    async def loop(self):
-        self._pending_stream_start = False
-        self._pending_preset = None
-
-        # Try connect OBS and MIDI at start
-        if self.cfg.AUTO_RECONNECT_OBS:
-            self.obs.connect()
-        self.midi.connect()
-
-        while self.running:
-            # Keep OBS connected
-            if self.cfg.AUTO_RECONNECT_OBS and not self.obs.is_connected():
-                self.obs.connect()
-
-            # Keep MIDI connected
-            if not self.midi.inport:
-                self.midi.connect()
-
-            # Camera readiness transitions
-            _ = self._camera_is_ready()
-
-            # If a preset was queued while waking, fire it once ready
-            if self._pending_preset is not None and self._camera_is_ready():
-                p = self._pending_preset
-                self._pending_preset = None
-                self._fire_preset(p, source="queued")
-
-            # Timer-based start (primary)
-            if self._timer_should_fire():
-                self.post("TIMER: start time reached → start stream flow")
-                self._start_stream_flow(source="TIMER")
-
-            # MIDI polling
-            for msg in self.midi.poll():
-                self.last_midi = str(msg)
-
-                # Only respond to channel + NOTE_ON
-                if self.midi.is_note_on(msg, self.cfg.NOTE_START_STREAM):
-                    self.post(f"MIDI: NOTE {self.cfg.NOTE_START_STREAM} → start stream")
-                    self._start_stream_flow(source="MIDI")
-
-                elif self.midi.is_note_on(msg, self.cfg.NOTE_STOP_STREAM):
-                    self.post(f"MIDI: NOTE {self.cfg.NOTE_STOP_STREAM} → stop stream")
-                    self._stop_stream_flow(source="MIDI")
-
-                elif self.midi.is_note_on(msg, self.cfg.NOTE_REC_TOGGLE):
-                    self.post(f"MIDI: NOTE {self.cfg.NOTE_REC_TOGGLE} → REC toggle")
-                    self._rec_toggle_flow(source="MIDI")
-
-                else:
-                    # Preset range 70..79 => presets 1..10
-                    try:
-                        n = msg.note
-                        if (msg.type == "note_on" and msg.velocity > 0
-                                and msg.channel == (self.cfg.MIDI_CHANNEL_1_BASED - 1)
-                                and self.cfg.NOTE_PRESET_FIRST <= n <= self.cfg.NOTE_PRESET_LAST):
-                            preset_1_based = (n - self.cfg.NOTE_PRESET_FIRST) + 1
-                            label = self.cfg.PRESET_LABELS.get(preset_1_based, f"Preset {preset_1_based}")
-                            self.post(f"MIDI: NOTE {n} → preset {preset_1_based} ({label})")
-                            self._fire_preset(preset_1_based, source="MIDI")
-                    except Exception:
-                        pass
-
-            # Handle delayed stop
-            if self.stop_pending_until is not None:
-                remaining = self.stop_pending_until - time.time()
-                if remaining <= 0:
-                    self.stop_pending_until = None
-                    self._do_stop_now(source="STOP-DELAY")
-                else:
-                    # light status update
-                    self.var_status.set(f"Stop pending… {int(remaining)}s")
-
-            # Update UI
-            self._update_ui()
-
-            await asyncio.sleep(0.1)
-
     def run(self):
-        # Run asyncio loop in background thread so Tkinter stays responsive
-        def runner():
-            asyncio.run(self.loop())
-
-        t = threading.Thread(target=runner, daemon=True)
-        t.start()
-
         self.root.mainloop()
-        self.running = False
 
 
 if __name__ == "__main__":
