@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
+import os
 import socket
 import threading
 import time
@@ -72,6 +74,28 @@ class Config:
     OBS_PORT: int = 4455
     OBS_PASSWORD: str = ""  # blank if OBS websocket auth is OFF
 
+    # ---- Optional OBS camera-source monitoring (NDI) ----
+    # Goal: warn you if the FoMaKo camera feed is missing inside OBS, so you know *why* a stream would fail.
+    # Configure EITHER:
+    #  - OBS_CAMERA_INPUT_NAME  (the OBS source/input name, as seen in the OBS "Sources" list)
+    # OR
+    #  - OBS_CAMERA_NDI_SENDER_NAME (the NDI sender name selected inside the NDI source properties)
+    #
+    # If OBS_CAMERA_INPUT_NAME is blank, the app will try to *find* the correct OBS input by scanning all
+    # inputs' settings for the NDI sender string.
+    OBS_CAMERA_INPUT_NAME: str = ""  # e.g. "fomako ndi"
+    OBS_CAMERA_NDI_SENDER_NAME: str = "NDI_HX (NDI-E477DA4C5898)"  # from the NDI source properties
+
+    # Optional: name of the scene where you expect the camera to be visible.
+    # Leave blank to check the current Program scene.
+    OBS_CAMERA_SCENE_NAME: str = ""
+
+    # How often to poll OBS for camera-source presence
+    CAMERA_SOURCE_CHECK_SECONDS: int = 5
+
+    # After camera wakes, if the source is still missing for this long, post a warning in the HUD
+    CAMERA_SOURCE_WARN_AFTER_SECONDS: int = 25
+
     AUTO_RECONNECT_OBS: bool = True
 
     # ---- Stream behavior ----
@@ -104,9 +128,12 @@ class Config:
 
     # ---- Optional timer start (primary start) ----
     USE_TIMER_START: bool = True
-    TIMER_START_HHMM: str = "09:45"  # local Regina time
+    TIMER_START_HHMM: str = "9:45"  # local Regina time
     TIMER_WEEKDAY: int = 6  # Monday=0 ... Sunday=6
     TIMEZONE: str = "America/Regina"
+    TIMER_PERSIST_STATE: bool = True
+    TIMER_STATE_FILE: str = "csg_timer_state.json"
+    TIMER_FIRE_GRACE_MINUTES: int = 15
 
     # Timezone fallback if ZoneInfo fails
     TZ_FALLBACK_MODE: str = "local"  # "local" or "fixed_offset"
@@ -311,6 +338,127 @@ class ObsController:
             return False, self.last_error
 
 
+
+    # -----------------------------
+    # Camera source monitoring (NDI)
+    # -----------------------------
+    def _safe_call(self, method_name: str, **kwargs):
+        """Call an obsws-python ReqClient method safely. Returns (resp, error_str_or_empty)."""
+        if not self.connected or not self.client:
+            return None, "OBS not connected"
+        fn = getattr(self.client, method_name, None)
+        if fn is None:
+            return None, f"OBS client missing method: {method_name}"
+        try:
+            resp = fn(**kwargs) if kwargs else fn()
+            return resp, ""
+        except Exception as e:
+            return None, str(e)
+
+    @staticmethod
+    def _get(obj, key: str, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _contains_text(container, needle: str) -> bool:
+        """Recursively search dict/list/str for a substring."""
+        if not needle:
+            return False
+        try:
+            if isinstance(container, str):
+                return needle in container
+            if isinstance(container, dict):
+                return any(ObsController._contains_text(v, needle) for v in container.values())
+            if isinstance(container, (list, tuple)):
+                return any(ObsController._contains_text(v, needle) for v in container)
+        except Exception:
+            return False
+        return False
+
+    def camera_source_status(self, cfg) -> dict:
+        """Return info about whether the camera source exists in OBS and whether it is visible."""
+        if not self.connected or not self.client:
+            return {"ok": None, "visible": None, "input": None, "detail": "OBS offline"}
+
+        # 1) list inputs
+        resp, err = self._safe_call("get_input_list")
+        if err:
+            return {"ok": None, "visible": None, "input": None, "detail": f"get_input_list failed: {err}"}
+
+        inputs = self._get(resp, "inputs", []) or []
+        names = []
+        for it in inputs:
+            nm = self._get(it, "inputName") or self._get(it, "sourceName") or self._get(it, "name")
+            if nm:
+                names.append(nm)
+
+        cam_input = None
+        mismatch_note = ""
+
+        # Prefer explicit OBS source name
+        if getattr(cfg, "OBS_CAMERA_INPUT_NAME", ""):
+            if cfg.OBS_CAMERA_INPUT_NAME in names:
+                cam_input = cfg.OBS_CAMERA_INPUT_NAME
+            else:
+                mismatch_note = f"Input '{cfg.OBS_CAMERA_INPUT_NAME}' not found."
+
+        # Otherwise try to discover by scanning settings for the NDI sender string
+        if cam_input is None and getattr(cfg, "OBS_CAMERA_NDI_SENDER_NAME", ""):
+            target = cfg.OBS_CAMERA_NDI_SENDER_NAME
+            for nm in names:
+                r2, e2 = self._safe_call("get_input_settings", inputName=nm)
+                if e2 or r2 is None:
+                    continue
+                settings = self._get(r2, "inputSettings", {}) or {}
+                if self._contains_text(settings, target):
+                    cam_input = nm
+                    break
+
+        if cam_input is None:
+            detail = mismatch_note or "Camera input not found (configure OBS_CAMERA_INPUT_NAME or OBS_CAMERA_NDI_SENDER_NAME)."
+            return {"ok": False, "visible": None, "input": None, "detail": detail}
+
+        # 2) (Optional) verify sender string is still selected (helps if multiple NDI sources exist)
+        if getattr(cfg, "OBS_CAMERA_NDI_SENDER_NAME", ""):
+            r3, e3 = self._safe_call("get_input_settings", inputName=cam_input)
+            if not e3 and r3 is not None:
+                settings = self._get(r3, "inputSettings", {}) or {}
+                if not self._contains_text(settings, cfg.OBS_CAMERA_NDI_SENDER_NAME):
+                    mismatch_note = f"NDI sender mismatch (expected '{cfg.OBS_CAMERA_NDI_SENDER_NAME}')."
+
+        # 3) is it in the program scene?
+        scene_name = getattr(cfg, "OBS_CAMERA_SCENE_NAME", "") or ""
+        if not scene_name:
+            r4, e4 = self._safe_call("get_current_program_scene")
+            if not e4 and r4 is not None:
+                scene_name = self._get(r4, "currentProgramSceneName") or self._get(r4, "sceneName") or ""
+
+        visible = None
+        if scene_name:
+            r5, e5 = self._safe_call("get_scene_item_list", sceneName=scene_name)
+            if not e5 and r5 is not None:
+                items = self._get(r5, "sceneItems", []) or []
+                found = False
+                for it in items:
+                    src = self._get(it, "sourceName") or self._get(it, "inputName") or self._get(it, "sceneItemName")
+                    if src == cam_input:
+                        visible = bool(self._get(it, "sceneItemEnabled", True))
+                        found = True
+                        break
+                if not found:
+                    visible = False
+
+        detail = f"Found input '{cam_input}'"
+        if scene_name and visible is not None:
+            detail += f" (scene='{scene_name}', visible={visible})"
+        if mismatch_note:
+            detail += f" | {mismatch_note}"
+        return {"ok": True, "visible": visible, "input": cam_input, "detail": detail}
+
 # =========================
 # MIDI Listener
 # =========================
@@ -426,6 +574,12 @@ class App:
         self.cam_state = "SLEEP"   # SLEEP | WAKING | AWAKE
         self.cam_ready_at: float = 0.0
 
+
+        # OBS camera-source monitoring (NDI)
+        self._cam_src_last_check: float = 0.0
+        self._cam_src_last_result: Optional[dict] = None
+        self._cam_src_warned: bool = False
+        self._cam_awake_since: Optional[float] = None
         self._queued_preset: Optional[int] = None
         self._pending_stream_start: bool = False  # requested start but waiting for cam/obs
         self._pending_start_reason: str = ""
@@ -433,8 +587,11 @@ class App:
         self._stop_pending: bool = False
         self._stop_at: float = 0.0
 
-        self._timer_fired_today_date: Optional[dt.date] = None
+        self._timer_done_today_date: Optional[dt.date] = None
+        self._timer_done_status: Optional[str] = None  # "fired" or "missed"
+        self._timer_done_time_hhmm: Optional[str] = None
         self._last_start_request_ts: float = 0.0
+        self._load_timer_state()
 
         # UI variables
         self.var_mode = tk.StringVar()
@@ -518,6 +675,68 @@ class App:
             self.var_cam.set(cam_line)
         self.root.after(0, _do)
 
+    def _camera_source_status_line(self) -> str:
+        """Returns a short status like 'SRC: OK' / 'SRC: MISSING' / 'SRC: (OBS offline)'."""
+        # If OBS monitoring isn't configured, don't clutter the HUD.
+        if not getattr(self.cfg, "OBS_CAMERA_INPUT_NAME", "") and not getattr(self.cfg, "OBS_CAMERA_NDI_SENDER_NAME", ""):
+            return ""
+
+        # Rate-limit the polling
+        now = time.time()
+        interval = max(1, int(getattr(self.cfg, "CAMERA_SOURCE_CHECK_SECONDS", 5)))
+        if (now - self._cam_src_last_check) < interval and self._cam_src_last_result is not None:
+            return self._format_cam_src_line(self._cam_src_last_result)
+
+        self._cam_src_last_check = now
+
+        # If OBS isn't connected (yet), return a helpful hint
+        if not self.obs.connected:
+            self._cam_src_last_result = {"ok": None, "visible": None, "input": None, "detail": "OBS offline"}
+            return self._format_cam_src_line(self._cam_src_last_result)
+
+        # Not all versions of obsws-python support every call; fail softly.
+        if not hasattr(self.obs, "camera_source_status"):
+            self._cam_src_last_result = {"ok": None, "visible": None, "input": None, "detail": "OBS camera check not supported"}
+            return self._format_cam_src_line(self._cam_src_last_result)
+
+        try:
+            res = self.obs.camera_source_status(self.cfg)
+        except Exception as e:
+            res = {"ok": None, "visible": None, "input": None, "detail": f"camera check error: {e}"}
+
+        self._cam_src_last_result = res
+
+        # One-time warning after camera is expected to be ready
+        warn_after = int(getattr(self.cfg, "CAMERA_SOURCE_WARN_AFTER_SECONDS", 25))
+        if (
+            self.cam_state == "AWAKE"
+            and self._cam_awake_since is not None
+            and not self._cam_src_warned
+            and warn_after > 0
+            and (now - self._cam_awake_since) >= warn_after
+        ):
+            ok = res.get("ok")
+            visible = res.get("visible")
+            if ok is False or visible is False:
+                self._cam_src_warned = True
+                self._post("WARN: camera feed not detected in OBS yet (check NDI source / network).")
+
+        return self._format_cam_src_line(res)
+
+    def _format_cam_src_line(self, res: dict) -> str:
+        ok = res.get("ok")
+        visible = res.get("visible")
+        if ok is None:
+            return "SRC: (OBS?)"
+        if ok is False:
+            return "SRC: MISSING"
+        # ok == True
+        if visible is True:
+            return "SRC: OK"
+        if visible is False:
+            return "SRC: FOUND (not in scene)"
+        return "SRC: FOUND"
+
     def _ui_fire(self, action: str):
         # Manual override always allowed
         if action == "start":
@@ -548,6 +767,8 @@ class App:
 
     def _camera_sleep(self, source: str):
         self.cam_state = "SLEEP"
+        self._cam_awake_since = None
+        self._cam_src_warned = False
         self.cam_ready_at = 0.0
         self._queued_preset = None
         if self.cfg.HOME_TEST_MODE:
@@ -562,6 +783,8 @@ class App:
     def _camera_ready_tick(self):
         if self.cam_state == "WAKING" and time.time() >= self.cam_ready_at:
             self.cam_state = "AWAKE"
+            self._cam_awake_since = time.time()
+            self._cam_src_warned = False
             self._post("CAM: awake/ready")
             # apply queued preset if any
             if self._queued_preset is not None:
@@ -693,6 +916,47 @@ class App:
             return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         return dt.datetime(now.year, now.month, now.day, hh, mm, 0)
 
+
+    def _timer_state_path(self) -> str:
+        # Store next to the script by default (portable with the repo).
+        base = self.cfg.TIMER_STATE_FILE
+        if os.path.isabs(base):
+            return base
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), base)
+
+    def _load_timer_state(self) -> None:
+        if not self.cfg.TIMER_PERSIST_STATE:
+            return
+        path = self._timer_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            date_s = data.get("date")
+            status = data.get("status")
+            hhmm = data.get("hhmm", self.cfg.TIMER_START_HHMM)
+            if not date_s or status not in ("fired", "missed"):
+                return
+            today = now_in_cfg_tz(self.cfg).date()
+            if date_s == today.isoformat():
+                self._timer_done_today_date = today
+                self._timer_done_status = status
+                self._timer_done_time_hhmm = hhmm
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+    def _save_timer_state(self, status: str, hhmm: str) -> None:
+        if not self.cfg.TIMER_PERSIST_STATE:
+            return
+        try:
+            today = now_in_cfg_tz(self.cfg).date()
+            data = {"date": today.isoformat(), "status": status, "hhmm": hhmm}
+            with open(self._timer_state_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            return
+
     def _timer_tick(self):
         if not self.cfg.USE_TIMER_START:
             self._set_timer_line("Timer: disabled")
@@ -712,8 +976,12 @@ class App:
 
         # Fire once per date
         today = now.date()
-        if self._timer_fired_today_date == today:
-            self._set_timer_line(f"Timer: fired today ({self.cfg.TIMER_START_HHMM})")
+        # If we already handled today's timer (even from a previous run), don't auto-start again.
+        if self._timer_done_today_date == today:
+            if self._timer_done_status == "missed":
+                self._set_timer_line(f"Timer: missed today ({self.cfg.TIMER_START_HHMM}) — manual start")
+            else:
+                self._set_timer_line(f"Timer: fired today ({self.cfg.TIMER_START_HHMM})")
             return
 
         # countdown
@@ -723,7 +991,29 @@ class App:
             return
 
         # time reached (or passed)
-        self._timer_fired_today_date = today
+        past_seconds = int(-delta)
+        grace_seconds = max(0, int(self.cfg.TIMER_FIRE_GRACE_MINUTES)) * 60
+        if past_seconds > grace_seconds:
+            # Too late — don't surprise-start the stream hours later.
+            self._timer_done_today_date = today
+            self._timer_done_status = "missed"
+            self._timer_done_time_hhmm = self.cfg.TIMER_START_HHMM
+            self._save_timer_state("missed", self.cfg.TIMER_START_HHMM)
+            self._set_timer_line(f"Timer: missed today ({self.cfg.TIMER_START_HHMM}) — manual start")
+            return
+
+        # Within grace window: fire once
+        self._timer_done_today_date = today
+        self._timer_done_status = "fired"
+        self._timer_done_time_hhmm = self.cfg.TIMER_START_HHMM
+        self._save_timer_state("fired", self.cfg.TIMER_START_HHMM)
+
+        # If OBS is already streaming, don't re-trigger.
+        streaming, _recording, _err = self.obs.get_status()
+        if streaming:
+            self._set_timer_line(f"Timer: fired today ({self.cfg.TIMER_START_HHMM})")
+            return
+
         self._set_timer_line("Timer: start time reached")
         self._start_stream_flow("TIMER")
 
@@ -797,8 +1087,8 @@ class App:
             else:
                 midi_line = f"MIDI: waiting ({self.midi.last_error})"
 
-            cam_line = f"CAM: {self.cam_state}"
-
+            cam_src = self._camera_source_status_line()
+            cam_line = f"CAM: {self.cam_state}" + (f" | {cam_src}" if cam_src else "")
             self._set_status_lines(obs_line, midi_line, cam_line)
 
             await asyncio.sleep(0.25)
