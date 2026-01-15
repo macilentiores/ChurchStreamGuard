@@ -1,9 +1,11 @@
 """
 stream_agent.py
 
-Stream Agent v7.6 - Static Banner + MIDI Stop Fix + Minimize Stability
+Stream Agent v7.7 - Per-Preset Delays (Feature-Gated) + v7.6 Stability
 
 Changes:
+- NEW: Optional per-preset delays for MIDI/automation (HUD presets remain immediate)
+  - Enable with ENABLE_PRESET_DELAYS; set PRESET_DELAYS_SECONDS per preset (0-30s)
 - Banner: "STREAM ENDED" for 60s after stop, then "READY"
 - Minimize: Stays minimized after normal stop; only restores on real issues while streaming
 - Marquee removed (static live banner)
@@ -21,6 +23,7 @@ import socket
 import threading
 import queue
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -49,7 +52,7 @@ class Config:
     HOME_TEST_MODE: bool = True
 
     AUTO_MINIMIZE_ENABLED: bool = True
-    AUTO_MINIMIZE_AFTER_SECONDS: int = 80
+    AUTO_MINIMIZE_AFTER_SECONDS: int = 5
 
     OBS_HOST: str = "127.0.0.1"
     OBS_PORT: int = 4455
@@ -65,6 +68,13 @@ class Config:
     STOP_DELAY_SECONDS: int = 30
     START_DEBOUNCE_SECONDS: float = 5.0
 
+    # Web HUD (tablet/remote browser on same LAN)
+    WEB_HUD_ENABLED: bool = True
+    WEB_HUD_HOST: str = "0.0.0.0"   # listen on all interfaces
+    WEB_HUD_PORT: int = 8765
+    WEB_HUD_TOKEN: str = ""         # optional shared token; leave blank to disable
+    WEB_HUD_LOG_LINES: int = 30
+
     CAMERA_IP: str = "192.168.88.20"
     CAMERA_VISCA_PORT: int = 1259
     VISCA_USE_OVERIP_HEADER: bool = False
@@ -72,6 +82,25 @@ class Config:
     CAMERA_BOOT_SECONDS: int = 20
     CAMERA_AUTO_WAKE_ON_PRESET: bool = True
     PRESET_NUMBER_BASE: int = 0
+
+    # Feature gate: delayed preset recall for MIDI/automation only (HUD remains immediate).
+    ENABLE_PRESET_DELAYS: bool = False
+
+    # Per-preset delay (seconds) for MIDI/automation preset recalls only.
+    # Values are clamped to 0..30 at runtime; missing keys default to 0.
+    PRESET_DELAYS_SECONDS: Dict[int, int] = field(default_factory=lambda: {
+        1: 0,   # lectern
+        2: 0,   # Panorama
+        3: 0,   # Children's Time (suggested starting point: 15-30)
+        4: 0,   # Altar
+        5: 0,   # Choir (suggested starting point: 10-20)
+        6: 0,   # Screen
+        7: 0,   # Band
+        8: 0,   # Piano
+        9: 0,   # (Unassigned)
+        10: 0,  # (Unassigned)
+    })
+
 
     MIDI_INPUT_PORT_SUBSTRING: str = "proclaim"
     MIDI_CHANNEL_1_BASED: int = 1
@@ -420,6 +449,18 @@ class App:
         self._ui_dirty = False
         self._was_streaming = False
 
+        # Shared state for Web HUD
+        self._log_buf = deque(maxlen=400)  # stores full formatted lines
+        self._web_dirty = False
+        self._state_version = 0
+        self._ws_clients = set()
+        self._web_runner = None
+        self._web_site = None
+        self._async_loop = None
+
+        # Commands from UI/web are funneled to the worker loop thread
+        self._cmd_queue = None  # created inside async loop
+
         self.running = True
         self.obs = ObsController(cfg)
         self.midi = MidiListener(cfg)
@@ -432,6 +473,11 @@ class App:
         self._cam_src_warned: bool = False
         self._cam_awake_since: Optional[float] = None
         self._queued_preset: Optional[int] = None
+        # Delayed preset scheduling (MIDI/automation only; HUD is immediate)
+        self._pending_preset: Optional[int] = None
+        self._pending_preset_due: float = 0.0
+        self._pending_preset_delay_s: int = 0
+        self._pending_preset_source: str = ""
         self._pending_stream_start: bool = False
         self._pending_start_reason: str = ""
 
@@ -543,6 +589,9 @@ class App:
         with self._ui_lock:
             self._ui_state.update(kwargs)
             self._ui_dirty = True
+            # Also mark Web HUD dirty
+            self._state_version += 1
+            self._web_dirty = True
 
     def _ui_pump(self):
         """Runs on UI thread; applies latest state and executes queued UI actions."""
@@ -590,6 +639,10 @@ class App:
     def _post(self, msg: str):
         ts = dt.datetime.now().strftime("%H:%M:%S")
         full = f"[{ts}] {msg}\n"
+        with self._ui_lock:
+            self._log_buf.append(full)
+            self._state_version += 1
+            self._web_dirty = True
 
         def _append():
             self.log_text.config(state="normal")
@@ -659,16 +712,58 @@ class App:
 
         return "READY", "Ready.Banner.TLabel"
 
+    def _enqueue_cmd(self, cmd: dict):
+        """Thread-safe enqueue into the worker loop."""
+        loop = self._async_loop
+        q = self._cmd_queue
+        if loop is None or q is None:
+            # Early startup fallback (should be rare)
+            self._post(f"HUD: command queued too early: {cmd}")
+            return
+
+        def _put():
+            try:
+                q.put_nowait(cmd)
+            except Exception as e:
+                self._post(f"CMD queue error: {e}")
+
+        try:
+            loop.call_soon_threadsafe(_put)
+        except Exception as e:
+            self._post(f"CMD enqueue failed: {e}")
+
     def _ui_fire(self, action: str):
-        if action == "start":
-            self._start_stream_flow("HUD")
-        elif action == "stop":
-            self._request_stop("HUD")
-        elif action == "rec":
-            self._toggle_record("HUD")
+        self._enqueue_cmd({"type": "action", "action": action, "source": "HUD"})
 
     def _ui_preset(self, preset_num: int):
-        self._handle_preset(preset_num, "HUD")
+        self._enqueue_cmd({"type": "preset", "preset": int(preset_num), "source": "HUD"})
+
+
+    async def _drain_cmds(self):
+        """Runs on worker thread; executes any queued commands."""
+        if self._cmd_queue is None:
+            return
+        while True:
+            try:
+                cmd = self._cmd_queue.get_nowait()
+            except Exception:
+                break
+
+            try:
+                ctype = cmd.get("type")
+                source = cmd.get("source", "WEB")
+                if ctype == "action":
+                    action = cmd.get("action")
+                    if action == "start":
+                        self._start_stream_flow(source)
+                    elif action == "stop":
+                        self._request_stop(source)
+                    elif action == "rec":
+                        self._toggle_record(source)
+                elif ctype == "preset":
+                    self._handle_preset(int(cmd.get("preset", 0)), source)
+            except Exception as e:
+                self._post(f"CMD error: {e}")
 
     def _camera_wake(self, source: str):
         if self.cam_state in ("WAKING", "AWAKE"):
@@ -690,6 +785,7 @@ class App:
         self._cam_src_warned = False
         self.cam_ready_at = 0.0
         self._queued_preset = None
+        self._cancel_pending_preset(source)
         if self.cfg.HOME_TEST_MODE:
             self._post(f"{source}: camera sleep simulated")
         else:
@@ -726,9 +822,86 @@ class App:
         except Exception as e:
             self._post(f"{source}: preset error: {e}")
 
+    def _clamped_preset_delay(self, preset_num: int) -> int:
+        """Return per-preset delay for MIDI/automation, clamped to 0..30 seconds."""
+        try:
+            raw = int((self.cfg.PRESET_DELAYS_SECONDS or {}).get(preset_num, 0))
+        except Exception:
+            raw = 0
+        return max(0, min(raw, 30))
+
+    def _cancel_pending_preset(self, reason: str = ""):
+        if self._pending_preset is None:
+            return
+        p = self._pending_preset
+        d = self._pending_preset_delay_s
+        self._pending_preset = None
+        self._pending_preset_due = 0.0
+        self._pending_preset_delay_s = 0
+        self._pending_preset_source = ""
+        if reason:
+            self._post(f"{reason}: cancelled pending preset {p} (delay {d}s)")
+
+    def _schedule_preset(self, preset_num: int, source: str, delay_s: int):
+        # Replace any previously scheduled preset
+        if self._pending_preset is not None and self._pending_preset != preset_num:
+            self._cancel_pending_preset(f"{source}")
+        self._pending_preset = preset_num
+        self._pending_preset_delay_s = delay_s
+        self._pending_preset_due = time.time() + delay_s
+        self._pending_preset_source = source
+        label = self.cfg.PRESET_LABELS.get(preset_num, f"Preset {preset_num}")
+        self._post(f"{source}: preset {preset_num} ({label}) scheduled in {delay_s}s")
+
+        # If camera is asleep and auto-wake is enabled, wake now so we're ready when delay elapses.
+        if self.cam_state == "SLEEP" and self.cfg.CAMERA_AUTO_WAKE_ON_PRESET:
+            self._camera_wake(f"{source}: wake for delayed preset")
+
+    def _preset_delay_tick(self):
+        """Fire a delayed preset when due and the camera is ready."""
+        if self._pending_preset is None:
+            return
+        if time.time() < self._pending_preset_due:
+            return
+        # Only execute when camera is awake (or in home test mode where presets are simulated anyway).
+        if not self.cfg.HOME_TEST_MODE and self.cam_state != "AWAKE":
+            return
+        p = self._pending_preset
+        src = self._pending_preset_source or "DELAY"
+        delay_s = self._pending_preset_delay_s
+        # Clear first to avoid re-entrancy surprises
+        self._pending_preset = None
+        self._pending_preset_due = 0.0
+        self._pending_preset_delay_s = 0
+        self._pending_preset_source = ""
+        self._send_preset(p, f"{src}: delayed({delay_s}s)")
+
     def _handle_preset(self, preset_num: int, source: str):
         if not (1 <= preset_num <= 10):
             return
+
+        # HUD presets are ALWAYS immediate (operator judgment). Also cancel any pending delayed preset.
+        if source == "HUD":
+            self._cancel_pending_preset("HUD")
+            if self.cam_state == "SLEEP" and self.cfg.CAMERA_AUTO_WAKE_ON_PRESET:
+                self._queued_preset = preset_num
+                self._camera_wake(f"{source}: wake for preset")
+                return
+            if self.cam_state == "WAKING":
+                self._queued_preset = preset_num
+                self._post(f"{source}: queued preset {preset_num}")
+                return
+            self._send_preset(preset_num, source)
+            return
+
+        # MIDI/automation presets: optional per-preset delay (feature gated)
+        if self.cfg.ENABLE_PRESET_DELAYS:
+            delay_s = self._clamped_preset_delay(preset_num)
+            if delay_s > 0:
+                self._schedule_preset(preset_num, source, delay_s)
+                return
+
+        # Default behavior (no delay)
         if self.cam_state == "SLEEP" and self.cfg.CAMERA_AUTO_WAKE_ON_PRESET:
             self._queued_preset = preset_num
             self._camera_wake(f"{source}: wake for preset")
@@ -884,9 +1057,444 @@ class App:
         self._set_ui_state(timer_text="Timer: starting stream now")
         self._start_stream_flow("TIMER")
 
+
+    # -----------------------------
+    # Web HUD (HTTP + WebSocket)
+    # -----------------------------
+    def _web_payload(self) -> dict:
+        # Single snapshot for WebSocket clients.
+        # Browser JS expects:
+        #   msg.type == "state"
+        #   msg.state (banner/lines/rec_on)
+        #   msg.logs (array of lines)
+        #   msg.preset_labels (map)
+        with self._ui_lock:
+            state = dict(self._ui_state)
+            logs = list(self._log_buf)[-int(self.cfg.WEB_HUD_LOG_LINES):]
+            ver = self._state_version
+        return {
+            "type": "state",
+            "ver": ver,
+            "state": {
+                "banner_text": state.get("banner_text", ""),
+                "banner_style": state.get("banner_style", "Banner.TLabel"),
+                "obs_line": state.get("obs_line", ""),
+                "midi_line": state.get("midi_line", ""),
+                "cam_line": state.get("cam_line", ""),
+                "timer_text": state.get("timer_text", ""),
+                "rec_on": bool(state.get("rec_on", False)),
+            },
+            "logs": logs,
+            "preset_labels": {int(k): v for k, v in self.cfg.PRESET_LABELS.items()},
+        }
+
+    def _web_html(self) -> str:
+        # Single-file HTML + external JS (avoids inline-script parsing issues)
+        # JS served from /app.js?v=10
+        return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Stream Agent HUD</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b1118; color:#e9eef5; }
+  .wrap { max-width:520px; margin:0 auto; padding:14px; }
+  .card { background:#121a24; border:1px solid #1d2a3a; border-radius:16px; padding:14px; margin:10px 0; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  .title { font-size:20px; font-weight:700; text-align:center; letter-spacing:.4px; }
+  .conn { margin-top:6px; font-size:12px; opacity:.8; text-align:center; white-space:pre-wrap; }
+  .row { display:flex; gap:10px; }
+  .btn { flex:1; padding:14px 10px; border-radius:14px; border:0; font-size:16px; font-weight:700; cursor:pointer; }
+  .btn:active { transform: translateY(1px); }
+  .bStart { background:#2fb14d; color:#06110a; }
+  .bStop  { background:#e14b45; color:#190606; }
+  .bRec   { background:#f0a018; color:#1d1202; }
+  .bRec.on { background:#ff3b3b; color:#180303; box-shadow: 0 0 0 2px rgba(255,59,59,.35) inset; }
+  .sectionTitle { font-size:13px; font-weight:700; opacity:.85; margin-bottom:8px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+  .pbtn { padding:12px 10px; border-radius:12px; border:1px solid #24354a; background:#0e1620; color:#e9eef5; font-size:14px; font-weight:650; cursor:pointer; }
+  .pbtn:active { transform: translateY(1px); }
+  pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.25; }
+  #logBox{ display:block; max-height:360px; overflow-y:auto; padding-right:6px; }
+  .hint { font-size:12px; opacity:.75; text-align:center; padding:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="title" id="statusTitle">CONNECTING…</div>
+    <div class="conn" id="connLine">Loading JavaScript…</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="btn bStart" id="btnStart">Start</button>
+      <button class="btn bStop" id="btnStop">Stop</button>
+      <button class="btn bRec" id="btnRec">REC</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="sectionTitle">Camera Presets</div>
+    <div class="grid" id="presetGrid"></div>
+  </div>
+
+  <div class="card">
+    <div class="sectionTitle">Log (last 30)</div>
+    <pre id="logBox"></pre>
+  </div>
+
+  <div class="hint"><noscript>This page needs JavaScript enabled.</noscript></div>
+</div>
+
+<script src="/app.js?v=10"></script>
+</body>
+</html>
+"""
+    def _web_js(self) -> str:
+        # ES5-only JS, served as /app.js (cache-busted by ?v=10)
+        # IMPORTANT: Use a raw string so backslashes (e.g. "\n") survive into JS.
+        return r"""(function(){
+  'use strict';
+  // Stream Agent HUD JS v1.8 (schema + newline fix)
+  try { console.log('Stream Agent HUD JS v1.8 loaded'); } catch (e) {}
+
+  function $(id){ return document.getElementById(id); }
+  var statusTitle = $('statusTitle');
+  var connLine = $('connLine');
+  var btnStart = $('btnStart');
+  var btnStop  = $('btnStop');
+  var btnRec   = $('btnRec');
+  var presetGrid = $('presetGrid');
+  var logBox = $('logBox');
+
+  function setConn(t){ if (connLine) connLine.textContent = t; }
+  function setTitle(t){ if (statusTitle) statusTitle.textContent = t; }
+
+  function getTokenQS(){
+    // If opened with ?token=XYZ, forward to /ws?token=XYZ
+    try {
+      var qs = window.location.search || '';
+      if (qs && qs.indexOf('token=') >= 0) return qs;
+    } catch (e) {}
+    return '';
+  }
+
+  var ws = null;
+var wsReady = false;
+
+  function setEnabled(enabled){
+    if (btnStart) btnStart.disabled = !enabled;
+    if (btnStop)  btnStop.disabled  = !enabled;
+    if (btnRec)   btnRec.disabled   = !enabled;
+    if (presetGrid){
+      var bs = presetGrid.getElementsByTagName('button');
+      for (var i=0; i<bs.length; i++) bs[i].disabled = !enabled;
+    }
+  }
+
+
+  function wsUrl(){
+    var proto = (window.location.protocol === 'https:') ? 'wss:' : 'ws:';
+    return proto + '//' + window.location.host + '/ws' + getTokenQS();
+  }
+
+  function send(obj){
+    try {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+      else setConn('Not connected yet — wait for "Connected"');
+    } catch (e) {
+      setConn('Send failed: ' + e);
+    }
+  }
+
+  function buildPresets(presetLabels){
+    while (presetGrid.firstChild) presetGrid.removeChild(presetGrid.firstChild);
+    for (var i=1; i<=10; i++){
+      var label = 'Preset ' + i;
+      if (presetLabels && presetLabels[i]) label = i + ': ' + presetLabels[i];
+
+      var b = document.createElement('button');
+      b.className = 'pbtn';
+      b.textContent = label;
+      b.disabled = !wsReady;
+      (function(n){
+        b.onclick = function(){ send({type:'cmd', cmd:'preset', value:n}); };
+      })(i);
+      presetGrid.appendChild(b);
+    }
+  }
+
+  function applyState(msg){
+    // msg schema: {type:'state', ver, state:{...}, logs:[...], preset_labels:{...}}
+    var st = (msg && msg.state) ? msg.state : null;
+
+    setTitle((st && st.banner_text) ? st.banner_text : 'READY');
+
+    var lines = [];
+    if (st && st.obs_line)  lines.push(st.obs_line);
+    if (st && st.midi_line) lines.push(st.midi_line);
+    if (st && st.cam_line)  lines.push(st.cam_line);
+    if (st && st.timer_text) lines.push(st.timer_text);
+    if (lines.length) setConn(lines.join("\n"));
+
+    var recOn = !!(st && st.rec_on);
+    if (btnRec) {
+      if (recOn) btnRec.classList.add('on');
+      else btnRec.classList.remove('on');
+    }
+
+    if (msg && msg.logs && logBox) {
+      logBox.textContent = msg.logs.join("\n");
+      try { logBox.scrollTop = logBox.scrollHeight; } catch (e) {}
+    }
+
+    if (msg && msg.preset_labels) {
+      var pl = {};
+      for (var k in msg.preset_labels) {
+        if (msg.preset_labels.hasOwnProperty(k)) {
+          var nk = parseInt(k, 10);
+          if (!isNaN(nk)) pl[nk] = msg.preset_labels[k];
+        }
+      }
+      buildPresets(pl);
+    } else {
+      buildPresets(null);
+    }
+  }
+
+  function connect(){
+    var url = wsUrl();
+    setConn('Connecting WS: ' + url);
+
+    wsReady = false;
+    setEnabled(false);
+
+    try { ws = new WebSocket(url); }
+    catch (e) { setConn('WebSocket ctor failed: ' + e); return; }
+
+    ws.onopen = function(){
+      wsReady = true;
+      setEnabled(true);
+      setConn('Connected');
+      send({type:'hello'});
+    };
+
+    ws.onmessage = function(ev){
+      try {
+        var msg = JSON.parse(ev.data);
+        if (msg && msg.type === 'state') applyState(msg);
+      } catch (e) {
+        setConn('Bad message: ' + e);
+      }
+    };
+
+    ws.onerror = function(){
+      setConn('WebSocket error (see DevTools Console)');
+    };
+
+    ws.onclose = function(){
+      wsReady = false;
+      setEnabled(false);
+      setConn('Disconnected — retrying in 2s');
+      setTimeout(connect, 2000);
+    };
+  }
+
+  // Safety: require a quick double-tap to confirm Start/Stop/REC on touch devices
+  var _confirmUntil = { start: 0, stop: 0, rec: 0 };
+  var _confirmMs = 2000;
+
+  function _setBtnText(btn, t){ try { if (btn) btn.textContent = t; } catch (e) {} }
+  function _getOrig(btn, fallback){
+    try {
+      if (!btn) return fallback;
+      if (!btn.dataset) return fallback;
+      if (!btn.dataset.origText) btn.dataset.origText = (btn.textContent || fallback);
+      return btn.dataset.origText || fallback;
+    } catch (e) { return fallback; }
+  }
+
+  function armOrSend(actionKey, btn, verbUpper, payload){
+    try {
+      var now = Date.now();
+      var until = _confirmUntil[actionKey] || 0;
+      var orig = _getOrig(btn, verbUpper);
+
+      if (until && now < until) {
+        _confirmUntil[actionKey] = 0;
+        _setBtnText(btn, orig);
+        send(payload);
+        return;
+      }
+
+      _confirmUntil[actionKey] = now + _confirmMs;
+      _setBtnText(btn, 'Tap again to ' + verbUpper);
+
+      setTimeout(function(){
+        try {
+          if (Date.now() >= (_confirmUntil[actionKey] || 0)) {
+            _confirmUntil[actionKey] = 0;
+            _setBtnText(btn, orig);
+          }
+        } catch (e) {}
+      }, _confirmMs + 50);
+    } catch (e) {
+      // If anything goes wrong, fall back to single-tap
+      send(payload);
+    }
+  }
+
+  if (btnStart) btnStart.onclick = function(){ armOrSend('start', btnStart, 'START', {type:'cmd', cmd:'start'}); };
+  if (btnStop)  btnStop.onclick  = function(){ armOrSend('stop',  btnStop,  'STOP',  {type:'cmd', cmd:'stop'}); };
+  if (btnRec)   btnRec.onclick   = function(){ armOrSend('rec',   btnRec,   'REC',   {type:'cmd', cmd:'rec'}); };
+
+  setEnabled(false);
+  buildPresets(null);
+  connect();
+})();"""
+
+    async def _start_web_server(self):
+        if not self.cfg.WEB_HUD_ENABLED:
+            return
+
+        try:
+            from aiohttp import web, WSMsgType
+        except Exception:
+            self._post("WEB: aiohttp not installed (pip install aiohttp) — web HUD disabled")
+            return
+
+        async def index(request):
+            # optional token check (only if configured)
+            if self.cfg.WEB_HUD_TOKEN:
+                tok = request.query.get("token", "")
+                if tok != self.cfg.WEB_HUD_TOKEN:
+                    return web.Response(status=403, text="Forbidden")
+            return web.Response(text=self._web_html(), content_type="text/html", charset="utf-8")
+
+        async def ws_handler(request):
+            if self.cfg.WEB_HUD_TOKEN:
+                tok = request.query.get("token", "")
+                if tok != self.cfg.WEB_HUD_TOKEN:
+                    return web.Response(status=403, text="Forbidden")
+
+            ws = web.WebSocketResponse(heartbeat=20)
+            await ws.prepare(request)
+
+            self._ws_clients.add(ws)
+            # Send an immediate snapshot
+            await ws.send_str(json.dumps(self._web_payload()))
+
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:
+                            continue
+                        if data.get("type") == "cmd":
+                            cmd = data.get("cmd")
+                            if cmd in ("start", "stop", "rec"):
+                                await self._cmd_queue.put({"type": "action", "action": cmd, "source": "WEB"})
+                            elif cmd == "preset":
+                                val = int(data.get("value", 0))
+                                await self._cmd_queue.put({"type": "preset", "preset": val, "source": "WEB"})
+                    elif msg.type == WSMsgType.ERROR:
+                        break
+            finally:
+                self._ws_clients.discard(ws)
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+            return ws
+
+        async def app_js(request):
+            # optional token check (only if configured) — keep same as index
+            if self.cfg.WEB_HUD_TOKEN:
+                tok = request.query.get("token", "")
+                if tok != self.cfg.WEB_HUD_TOKEN:
+                    return web.Response(status=403, text="Forbidden")
+            return web.Response(text=self._web_js(), content_type="application/javascript", charset="utf-8")
+
+        async def favicon(request):
+            # avoid noisy 404s
+            return web.Response(status=204, text="")
+
+
+        app = web.Application()
+        app.add_routes([web.get("/", index), web.get("/ws", ws_handler), web.get("/app.js", app_js), web.get("/favicon.ico", favicon)])
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host=self.cfg.WEB_HUD_HOST, port=int(self.cfg.WEB_HUD_PORT))
+        await site.start()
+
+        self._web_runner = runner
+        self._web_site = site
+        self._post(f"WEB: HUD at http://{self._local_ip_hint()}:{int(self.cfg.WEB_HUD_PORT)}")
+
+    async def _stop_web_server(self):
+        try:
+            # Close clients
+            for ws in list(self._ws_clients):
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            self._ws_clients.clear()
+            if self._web_runner:
+                await self._web_runner.cleanup()
+        except Exception:
+            pass
+        finally:
+            self._web_runner = None
+            self._web_site = None
+
+    def _local_ip_hint(self) -> str:
+        # Best-effort: pick a non-loopback address
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    async def _broadcast_web_state_if_dirty(self):
+        if not self.cfg.WEB_HUD_ENABLED or not self._ws_clients:
+            return
+
+        dirty = False
+        with self._ui_lock:
+            if self._web_dirty:
+                dirty = True
+                self._web_dirty = False
+
+        if not dirty:
+            return
+
+        payload = json.dumps(self._web_payload())
+        dead = []
+        for ws in list(self._ws_clients):
+            try:
+                await ws.send_str(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self._ws_clients.discard(ws)
+
     async def loop(self):
+        self._async_loop = asyncio.get_running_loop()
+        self._cmd_queue = asyncio.Queue()
+        await self._start_web_server()
+
         startup_grace = 20.0
         while self.running:
+            await self._drain_cmds()
             if not self.obs.connected and self.cfg.AUTO_RECONNECT_OBS:
                 self.obs.connect()
 
@@ -917,6 +1525,7 @@ class App:
                     self._start_stream_flow(reason)
 
             self._camera_ready_tick()
+            self._preset_delay_tick()
             self._stop_tick()
             self._timer_tick()
 
@@ -996,7 +1605,10 @@ class App:
 
             self._was_streaming = streaming
 
+            await self._broadcast_web_state_if_dirty()
             await asyncio.sleep(0.25)
+
+        await self._stop_web_server()
 
     def _runner(self):
         try:
