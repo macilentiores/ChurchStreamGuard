@@ -17,13 +17,12 @@ A small Windows app (Python + Tkinter) that helps automate church live streaming
 This repo can include **two variants**:
 
 1) **PC-only** (Tkinter window only)  
-   - Run on the streaming PC; manual fallback buttons + presets are inside the desktop HUD.
+   Run on the streaming PC; manual fallback buttons + presets are inside the desktop HUD.
 
 2) **Web HUD** (Tkinter window + built-in web server)  
-   - Adds a phone/tablet control page on the same LAN.
-   - Uses a WebSocket connection to the app.
+   Adds a phone/tablet control page on the same LAN and uses a WebSocket connection to the app.
 
-If your repo has only one script: the current Stream Agent II code has a `WEB_HUD_ENABLED` config flag you can flip on/off. fileciteturn13file2L27-L33
+If you only keep one script, Stream Agent II also supports a `WEB_HUD_ENABLED` config flag you can flip on/off.
 
 ---
 
@@ -37,16 +36,18 @@ If your repo has only one script: the current Stream Agent II code has a `WEB_HU
 Python packages (typical):
 - `obsws-python` (OBS WebSocket client)
 - `mido` + `python-rtmidi` (MIDI input)
+- `aiohttp` (required only if Web HUD is enabled)
 
 ---
 
 ## Installation
 
 1) Clone or download this repository.
+
 2) Install dependencies (example):
 
 ```powershell
-py -m pip install obsws-python mido python-rtmidi
+py -m pip install obsws-python mido python-rtmidi aiohttp
 ```
 
 3) Run (console, for debugging):
@@ -65,49 +66,48 @@ pythonw .\stream_agent.py
 
 ## Church test checklist (settings to review)
 
-All key settings are near the top in the `Config` class. fileciteturn13file2L6-L40
+All key settings are near the top in the `Config` section.
 
 ### Mode
 - `HOME_TEST_MODE`
-  - `True` = simulate camera power/presets (safe for home testing) fileciteturn12file0L773-L791
-  - `False` = send real VISCA UDP commands and power off camera at the end of service fileciteturn13file11L84-L85
+  - `True` = simulate camera power/presets (safe for home testing)
+  - `False` = send real VISCA UDP commands and power off camera at the end of service
 
 ### OBS
-- `OBS_HOST`, `OBS_PORT`, `OBS_PASSWORD` must match OBS WebSocket server settings. fileciteturn13file2L13-L16  
+- `OBS_HOST`, `OBS_PORT`, `OBS_PASSWORD` must match OBS WebSocket server settings.
   - On the same PC as OBS, `OBS_HOST = "127.0.0.1"` is correct.
 
 **Camera-in-OBS check (optional but recommended)**
-- The app can periodically check whether the camera feed exists in OBS and warn if missing. fileciteturn12file0L322-L349  
-  Configure either:
-  - `OBS_CAMERA_INPUT_NAME` (exact OBS input name), or fileciteturn12file0L333-L336
-  - `OBS_CAMERA_NDI_SENDER_NAME` (string it searches for inside input settings; helpful for NDI sources). fileciteturn12file0L336-L345
+The app can check whether the camera feed exists in OBS and warn if missing. Configure either:
+- `OBS_CAMERA_INPUT_NAME` (exact OBS input name), or
+- `OBS_CAMERA_NDI_SENDER_NAME` (string it searches for inside input settings; helpful for NDI sources)
 
-**NDI note:** NDI (Network Device Interface) is the “network video source” tech often used for Proclaim → OBS.
+**NDI note:** NDI (Network Device Interface) is commonly used for Proclaim → OBS as a network video source.
 
 ### Camera (FoMaKo PTZ)
-- `CAMERA_IP` should be the camera’s LAN IP (example shown is `192.168.88.20`). fileciteturn13file2L34-L36  
-- `CAMERA_VISCA_PORT` (example `1259`) must match the camera’s VISCA-over-IP/UDP port. fileciteturn13file2L34-L36  
+- `CAMERA_IP` should be the camera’s LAN IP (example: `192.168.88.20`)
+- `CAMERA_VISCA_PORT` (example: `1259`) must match the camera’s VISCA-over-IP/UDP port
 - `CAMERA_AUTO_WAKE_ON_PRESET`
-  - If `True`, recalling a preset can automatically wake the camera first (so you don’t have to manually power it on). fileciteturn12file0L856-L858
+  - If `True`, recalling a preset can automatically wake the camera first
 - `PRESET_NUMBER_BASE`
-  - Some cameras treat “preset 1” as VISCA `pp=00` (0‑based); others as `pp=01`. If presets are “off by one”, adjust this. fileciteturn13file2L40-L41
+  - Some cameras treat “preset 1” as VISCA `pp=00` (0‑based); others as `pp=01`. If presets are “off by one”, adjust this.
 
 ### Stop delay (end-of-service)
-- `STOP_DELAY_SECONDS`: delay between a “stop” command and the actual stop action. fileciteturn13file2L24-L26  
-  - The app uses this delay before stopping stream and (in church mode) powering off the camera. fileciteturn13file11L68-L85
+- `STOP_DELAY_SECONDS`: delay between a “stop” command and the actual stop action.
+  - The app uses this delay before stopping stream and (in church mode) powering off the camera.
 
 ### Timer auto-start (optional)
-- `USE_TIMER_START`, `TIMER_START_HHMM`, `TIMER_WEEKDAY`, `TIMEZONE` fileciteturn13file2L70-L77  
-  - `TIMER_WEEKDAY` follows Python’s `weekday()` convention: Monday=0 … Sunday=6 (so `6` = Sunday). fileciteturn9file7L11-L15  
-  - `TIMEZONE` is set to `America/Regina` in current config. fileciteturn13file2L72-L74
+- `USE_TIMER_START`, `TIMER_START_HHMM`, `TIMER_WEEKDAY`, `TIMEZONE`
+  - `TIMER_WEEKDAY` follows Python’s `weekday()` convention: Monday=0 … Sunday=6 (so `6` = Sunday).
+  - `TIMEZONE` is typically `America/Regina` for Regina, Saskatchewan.
 
 ---
 
 ## Web HUD (phone/tablet control page)
 
 ### Enable / disable
-- `WEB_HUD_ENABLED` turns the web page on/off. fileciteturn13file2L27-L33  
-- `WEB_HUD_HOST` and `WEB_HUD_PORT` control where it listens (default port: `8765`). fileciteturn13file2L27-L32
+- `WEB_HUD_ENABLED` turns the web page on/off.
+- `WEB_HUD_HOST` and `WEB_HUD_PORT` control where it listens (default port: `8765`).
 
 ### How to open it
 From a phone/tablet on the same LAN:
@@ -116,34 +116,36 @@ From a phone/tablet on the same LAN:
 Example:
 - `http://192.168.88.21:8765/`
 
+> Note: `127.0.0.1` works only on the same device. On a phone/tablet you must use the PC’s LAN IP.
+
 ### Safety: double-tap confirmation (Web HUD)
-The Web HUD supports a “double tap” confirmation pattern for the high-risk buttons (Start / Stop / Record): first tap arms the button, second tap confirms within a short window (this prevents accidental triggers).
+The Web HUD uses a “double tap” confirmation pattern for the high-risk buttons (Start / Stop / Record):
+- First tap arms the action for ~2 seconds
+- Second tap confirms within that window
+- Preset buttons remain immediate
 
 ### Web HUD token (optional)
-`WEB_HUD_TOKEN` is an optional shared secret; leave it blank to disable token checks. fileciteturn13file2L30-L32
-
-If you set a token:
-- Open the page with `?token=YOURTOKEN`
-- The page forwards `?token=...` to the WebSocket endpoint as well. fileciteturn13file10L33-L39
+`WEB_HUD_TOKEN` is an optional shared secret. If you set a token, you must open the HUD with `?token=YOURTOKEN`.
 
 Example:
 - `http://192.168.88.21:8765/?token=YOURTOKEN`
 
-**Note:** This is not full “internet security” (no TLS/HTTPS by default). It’s a simple shared token intended for **same-LAN** use.
+If the token is missing or wrong, the server returns **403 Forbidden**.
+
+**Note:** This is not full “internet security” (no TLS/HTTPS by default). It’s a simple shared token intended for same-LAN use. For remote access over the internet, use a VPN.
 
 ---
 
 ## MIDI mapping
 
 ### Current defaults in Stream Agent II
-The current Stream Agent II config defaults use:
 - Start stream: note `60`
 - Stop stream: note `61`
-- Record toggle: note `62` fileciteturn13file2L64-L68  
-- Presets: notes `70–79` → presets `1–10` fileciteturn13file2L67-L68
+- Record toggle: note `62`
+- Presets: notes `70–79` → presets `1–10`
 
-### Preset names (as used in the older README)
-Camera presets (notes 70–79): fileciteturn13file0L7-L28
+### Preset names
+Camera presets (notes 70–79):
 
 - 70 → Preset 1 (**Pulpit**)  
 - 71 → Preset 2 (**Panorama**)  
@@ -156,11 +158,10 @@ Camera presets (notes 70–79): fileciteturn13file0L7-L28
 - 78 → Preset 9 (**Unassigned**)  
 - 79 → Preset 10 (**Unassigned**)
 
-**Label note:** the current config labels preset 1 as `"lectern"` by default. You can change `PRESET_LABELS` so it matches your real-world names (e.g., change `"lectern"` → `"Pulpit"`). fileciteturn13file5L37-L48
+If your script includes `PRESET_LABELS`, you can edit it so the on-screen labels match the names above.
 
-### Service control (older README mapping)
-The older README used a different “service control” note range (80+). fileciteturn13file0L30-L45  
-If you prefer that mapping, you can change the note numbers in the config (`NOTE_START_STREAM`, etc.). fileciteturn13file2L64-L68
+### Older “service control” mapping
+If you prefer using a different note range (e.g., 80+ for start/stop/record/power), just change the note numbers in the config (`NOTE_START_STREAM`, etc.) to match your Proclaim MIDI cues.
 
 ---
 
@@ -168,9 +169,9 @@ If you prefer that mapping, you can change the note numbers in the config (`NOTE
 
 Some moments (like “Children’s Time” or “Choir”) may need a small delay so the camera lands after people have moved.
 
-- Enable with `ENABLE_PRESET_DELAYS = True` fileciteturn13file2L42-L44
-- Set delay seconds per preset in `PRESET_DELAYS_SECONDS` (clamped to 0–30 seconds). fileciteturn12file0L825-L832
-- Important: **HUD presets are always immediate** (operator judgment), and will cancel any pending delayed preset. fileciteturn13file12L39-L41
+- Enable with `ENABLE_PRESET_DELAYS = True`
+- Set delay seconds per preset in `PRESET_DELAYS_SECONDS` (clamped to 0–30 seconds)
+- HUD presets are always immediate (operator judgment)
 
 ---
 
@@ -178,4 +179,5 @@ Some moments (like “Children’s Time” or “Choir”) may need a small dela
 
 - Don’t commit stream keys, passwords, or private tokens to GitHub.
 - Keep a manual fallback plan (desktop HUD buttons, or direct OBS control).
-- If your camera must be powered off between services (to avoid crashing), confirm church mode is active (`HOME_TEST_MODE = False`) so the app powers off the camera at the end of service. fileciteturn13file11L84-L85
+- Keep phones/tablets on the correct LAN/SSID (avoid guest Wi‑Fi isolation).
+- If your camera must be powered off between services (to avoid crashing), confirm church mode is active (`HOME_TEST_MODE = False`) so the app powers off the camera at the end of service.
