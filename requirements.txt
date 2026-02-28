@@ -1,4 +1,23 @@
-obsws-python>=1.7.0
-mido>=1.3.2
-python-rtmidi>=1.5.8
-requests>=2.31.0
+# ChurchStreamGuard (Stream Agent II) — Python dependencies
+# Install with:
+#   py -m pip install -r requirements.txt
+#
+# Notes:
+# - tkinter is part of standard Python on Windows (no pip package).
+# - If you do NOT use MIDI, you can omit mido/python-rtmidi.
+
+# Web HUD + Config UI (aiohttp web server)
+aiohttp
+
+# OBS control via OBS WebSocket (obsws-python)
+obsws-python
+
+# MIDI input (Proclaim cues)
+mido
+python-rtmidi
+
+# Optional: used for graceful closing of other apps in the service-end sequence
+psutil
+
+# Timezone database for Windows (helps zoneinfo find IANA zones like America/Regina)
+tzdata
