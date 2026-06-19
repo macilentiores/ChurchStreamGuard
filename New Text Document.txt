@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-.env
-config_local.py
-*.log
