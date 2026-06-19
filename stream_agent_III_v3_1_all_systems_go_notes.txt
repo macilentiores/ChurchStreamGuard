@@ -1,0 +1,84 @@
+Stream Agent III v3.1 — All Systems Go / Health Report
+Date: 2026-05-25
+
+Base file used:
+- stream_agent_III_v3_0_3_director_layout_polish.py
+
+Reference defaults used:
+- stream_agent_III.py
+- The Config defaults from the older reference were compared against v3.0.3.
+- Only one default differed: LOG_DIR.
+- v3.1 now uses the older/reference default:
+  LOG_DIR = r"C:\ChurchAutomation\Stream_Agent_III_logs"
+
+New feature:
+- Added a read-only All Systems Go / Preflight health report page at:
+  /preflight
+
+New API endpoint:
+- /api/health_report
+
+Existing heartbeat retained:
+- /health still returns plain text:
+  ok
+
+Purpose:
+- /health remains the basic web-server heartbeat.
+- /preflight and /api/health_report provide the fuller confidence check.
+
+Health report overall result:
+- GO
+- CAUTION
+- NO-GO
+
+Checks included:
+- SA III Web HUD request/command queue
+- OBS WebSocket connection
+- OBS stream/record status
+- OBS active stream state during live operation
+- Auto-recovery state
+- OBS profile match against NHLC
+- Current OBS scene readability
+- Required OBS scenes:
+  Introduction, West View, East View
+- Required OBS inputs:
+  Intro_Video, West_axis, East_axis
+- Optional/caution OBS input:
+  slides
+- Audio mode:
+  expects axis_embedded for normal church operation
+- Audio targets:
+  West_axis and East_axis
+- OBS audio meter freshness
+- West Axis camera HTTP reachability
+- East Axis camera HTTP reachability
+- Director preview freshness
+- Proclaim MIDI connection
+- Log folder writability
+- Timer sanity
+- Recent critical faults
+
+Safety design:
+- The health report is read-only.
+- It does not start or stop streaming.
+- It does not switch OBS profiles.
+- It does not move cameras.
+- It does not change configuration.
+- Axis camera reachability uses a read-only HTTP check and does not call PTZ presets.
+
+Web HUD changes:
+- Added an “All Systems Go” button on the main HUD.
+- Added an “All Systems Go” button on the Director page toolbar.
+
+Validation performed in sandbox:
+- Python compile check: PASS
+- AST parse: PASS
+- Import without launching GUI: PASS
+- Config default comparison against older reference: PASS
+- Preflight HTML generation: PASS
+- Preflight JavaScript generation: PASS
+- Health report generation with mocked offline OBS: PASS
+
+Important live-test note:
+- I cannot verify actual OBS, Axis cameras, MIDI, or YouTube from the sandbox.
+- On BeelinkOBS, open /preflight and verify that the report correctly changes from NO-GO/CAUTION to GO as OBS, Proclaim MIDI, camera previews, and audio meter become available.
