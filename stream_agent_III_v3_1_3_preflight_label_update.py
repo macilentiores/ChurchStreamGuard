@@ -421,7 +421,8 @@ class Config:
     # Hardening added after the May 17 service: the intro media must not restart
     # until OBS confirms the Introduction scene is actually on Program. This avoids
     # playing Intro_Video off-air if OBS is still sitting on West/East.
-    INTRO_FORCE_CUT_TRANSITION: bool = True
+    INTRO_FORCE_CUT_TRANSITION: bool = False
+
     INTRO_SCENE_SWITCH_RETRIES: int = 8
     INTRO_SCENE_SWITCH_RETRY_SECONDS: float = 0.35
     INTRO_ABORT_IF_SCENE_NOT_LIVE: bool = True
@@ -443,7 +444,7 @@ class Config:
     # ----------------------------
     # STREAM SAFETY
     # ----------------------------
-    STOP_DELAY_SECONDS: int = 30
+    STOP_DELAY_SECONDS: int = 90
     START_DEBOUNCE_SECONDS: float = 5.0
 
     # ----------------------------
@@ -618,9 +619,9 @@ class Config:
     # ----------------------------
     ENABLE_PRESET_DELAYS: bool = True
     PRESET_DELAYS_SECONDS: Dict[int, int] = field(default_factory=lambda: {
-        1: 20,  #pulpit
+        1: 0,  #pulpit
         2: 0,   #panorama
-        3: 20,  #Children's Time
+        3: 10,  #Children's Time
         4: 10,  #alter
         5: 10,  #choir
         6: 0,   #screen
